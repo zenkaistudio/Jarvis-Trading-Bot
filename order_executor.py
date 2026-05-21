@@ -169,6 +169,7 @@ class OrderExecutor:
             "tradableInstrumentId": instrument["tradableInstrumentId"],
             "routeId": instrument["route_trade"],
             "type": "Limit",
+            "validity": "GTC",
             "side": side,
             "qty": lots,
             "price": entry,
