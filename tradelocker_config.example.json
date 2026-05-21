@@ -1,0 +1,27 @@
+{
+  "email": "YOUR_TRADELOCKER_EMAIL",
+  "password": "YOUR_TRADELOCKER_PASSWORD",
+  "server": "YOUR_BROKER_SERVER_NAME",
+  "account_type": "live",
+  "broker": "YOUR_BROKER_NAME",
+  "account_id": "YOUR_ACCOUNT_ID",
+  "acc_num": "YOUR_ACC_NUM",
+  "base_url": "https://live.tradelocker.com/backend-api",
+  "auth_endpoint": "/auth/jwt/token",
+  "accounts_endpoint": "/auth/jwt/all-accounts",
+  "history_endpoint": "/trade/history",
+  "instruments_endpoint": "/trade/accounts/YOUR_ACCOUNT_ID/instruments",
+  "route_id_info": 0,
+  "route_id_trade": 0,
+  "history_params_note": "Use routeId from route_id_info for candle data. tradableInstrumentId from instruments list.",
+  "watchlist": {
+    "EURUSD":  { "tradableInstrumentId": 0, "routeId": 0, "type": "FOREX" },
+    "GBPJPY":  { "tradableInstrumentId": 0, "routeId": 0, "type": "FOREX" },
+    "XAUUSD":  { "tradableInstrumentId": 0, "routeId": 0, "type": "COMMODITY" },
+    "NAS100":  { "tradableInstrumentId": 0, "routeId": 0, "type": "INDEX" },
+    "NZDJPY":  { "tradableInstrumentId": 0, "routeId": 0, "type": "FOREX" },
+    "AUDCAD":  { "tradableInstrumentId": 0, "routeId": 0, "type": "FOREX" }
+  },
+  "resolutions": ["1H", "15m", "4H", "1D"],
+  "last_verified": "YYYY-MM-DD"
+}

@@ -1,0 +1,22 @@
+# Credentials and secrets — never commit these
+jarvis_config.json
+tradelocker_config.json
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
