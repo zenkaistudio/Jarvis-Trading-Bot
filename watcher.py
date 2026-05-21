@@ -229,6 +229,17 @@ class SetupWatcher:
 
         return msgs
 
+    def remove_by_symbol(self, symbol: str) -> int:
+        to_remove = [sid for sid, s in self._setups.items() if s.symbol == symbol.upper()]
+        for sid in to_remove:
+            del self._setups[sid]
+        return len(to_remove)
+
+    def clear_all(self) -> int:
+        count = len(self._setups)
+        self._setups.clear()
+        return count
+
     def watchlist_summary(self) -> str:
         active = self.active_setups()
         if not active:

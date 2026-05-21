@@ -38,18 +38,30 @@ def _parse_symbol(text: str):
 HELP_TEXT = """
 🤖 *Jarvis — Command List*
 
+*Overview*
+`summary` — balance, trades & watched levels at a glance
+
 *Account*
 `balance` — account balance
 `positions` — open trades
+`pnl` — floating profit/loss on open trades
 
-*Prices*
+*Prices & Bias*
 `price GBPJPY` — live price for any symbol
+`bias GBPJPY` — quick directional bias (structure + VWAP)
 
 *Analysis*
 `scan GBPJPY` — full SMC scan + auto-watch levels
 `scan all` — scan entire watchlist
 `gbpjpy` — full KJ confluence check + auto-watch levels
+`rescan` — force immediate rescan right now
+
+*Watchlist*
 `watching` — see all levels Jarvis is tracking
+`clear GBPJPY` — remove a symbol's watched setups
+`clear all` — clear all watched setups
+`add EURUSD` — add symbol to scan watchlist
+`remove EURUSD` — remove symbol from scan watchlist
 
 *Auto-Trading*
 `auto on` — enable auto order placement
@@ -237,6 +249,9 @@ class JarvisMonitor:
             if text in ("help", "/help", "/start"):
                 return HELP_TEXT
 
+            if text in ("summary", "overview", "dashboard"):
+                return self._do_summary()
+
             if any(w in text for w in ("balance", "account", "equity")):
                 info = self.client.get_account_info()
                 accounts = info.get("accounts", [info])
@@ -249,6 +264,9 @@ class JarvisMonitor:
                     )
                 return f"`{json.dumps(info)}`"
 
+            if any(w in text for w in ("pnl", "profit", "p&l")):
+                return self._do_pnl()
+
             if any(w in text for w in ("position", "trade", "open")):
                 positions = self.client.get_positions()
                 if not positions:
@@ -260,8 +278,29 @@ class JarvisMonitor:
                 tick = self.client.get_tick(symbol)
                 return f"📈 *{symbol}*: `{tick['price']}`\n_as of {tick['time']}_"
 
+            if text.startswith("bias"):
+                symbol = _parse_symbol(text)
+                if not symbol:
+                    return "❓ Usage: `bias GBPJPY`"
+                return self._do_bias(symbol)
+
             if any(w in text for w in ("watching", "watchlist", "levels", "watch")):
                 return self.watcher.watchlist_summary()
+
+            if text in ("clear all", "clear everything", "reset watch", "reset watchlist"):
+                count = self.watcher.clear_all()
+                return f"🗑 Cleared {count} setup(s) from watchlist."
+
+            if text.startswith("clear"):
+                symbol = _parse_symbol(text)
+                if symbol:
+                    count = self.watcher.remove_by_symbol(symbol)
+                    return f"🗑 Removed {count} {symbol} setup(s)." if count else f"No {symbol} setups in watchlist."
+                return "❓ Usage: `clear GBPJPY` or `clear all`"
+
+            if text in ("rescan", "scan now", "force scan"):
+                threading.Thread(target=self._force_rescan, daemon=True).start()
+                return "🔄 Forcing rescan now... You'll get alerts if setups are found."
 
             if any(w in text for w in ("scan all", "all symbols", "all pairs")):
                 self._notify("🔍 Scanning all symbols... ~30 seconds.")
@@ -342,6 +381,30 @@ class JarvisMonitor:
                 self._load_and_set("trade_mode", "live")
                 return "🔴 *Switched to LIVE account.* Be careful."
 
+            if text.startswith("add "):
+                symbol = _parse_symbol(text)
+                if symbol:
+                    config = self._load_config()
+                    wl = config.get("watchlist", [])
+                    if symbol not in wl:
+                        wl.append(symbol)
+                        self._load_and_set("watchlist", wl)
+                        return f"✅ Added `{symbol}` to watchlist. ({len(wl)} symbols)"
+                    return f"`{symbol}` is already in the watchlist."
+                return "❓ Usage: `add EURUSD`"
+
+            if text.startswith("remove "):
+                symbol = _parse_symbol(text)
+                if symbol:
+                    config = self._load_config()
+                    wl = config.get("watchlist", [])
+                    if symbol in wl:
+                        wl.remove(symbol)
+                        self._load_and_set("watchlist", wl)
+                        return f"✅ Removed `{symbol}` from watchlist. ({len(wl)} symbols)"
+                    return f"`{symbol}` is not in the watchlist."
+                return "❓ Usage: `remove EURUSD`"
+
             if any(w in text for w in ("start", "monitor on")):
                 return "Jarvis is already running." if self._running else self.start()
 
@@ -362,6 +425,75 @@ class JarvisMonitor:
 
         except Exception as e:
             return f"⚠️ Error: {e}"
+
+    # ── New command helpers ───────────────────────────────────────────────────
+
+    def _do_summary(self) -> str:
+        config = self._load_config()
+        mode = config.get("trade_mode", "demo").upper()
+        auto = config.get("auto_trade", False)
+        risk = config.get("risk_percent", 2.0)
+        try:
+            info = self.client.get_account_info()
+            accounts = info.get("accounts", [info])
+            a = accounts[0] if accounts else {}
+            balance = f"${a.get('accountBalance', 'N/A')} {a.get('currency', 'USD')}"
+        except Exception:
+            balance = "unavailable"
+        try:
+            positions = self.client.get_positions()
+            pos_count = len(positions)
+        except Exception:
+            pos_count = 0
+        active = self.watcher.active_setups()
+        watch_lines = "\n".join(f"  • {s.symbol} {s.direction} ({s.status})" for s in active) if active else "  None"
+        return (
+            f"📊 *Jarvis Summary*\n\n"
+            f"Mode: `{mode}` | Auto: `{'ON ✅' if auto else 'OFF 🔒'}` | Risk: `{risk}%`\n"
+            f"Balance: `{balance}`\n"
+            f"Open Trades: `{pos_count}`\n\n"
+            f"*Watching ({len(active)}):*\n{watch_lines}"
+        )
+
+    def _do_bias(self, symbol: str) -> str:
+        result = run_smc_scan(symbol, self.client)
+        structure = result.get("structure", "N/A").upper()
+        vwap_bias = result.get("vwap", {}).get("bias", "N/A")
+        tl = result.get("trendlines", {})
+        tl_bias = tl.get("trend", "N/A") if tl else "N/A"
+        return (
+            f"📐 *{symbol} Bias*\n\n"
+            f"4H Structure: `{structure}`\n"
+            f"VWAP: `{vwap_bias}`\n"
+            f"Trendline: `{tl_bias}`\n\n"
+            f"_Type `scan {symbol}` for full setup._"
+        )
+
+    def _do_pnl(self) -> str:
+        positions = self.client.get_positions()
+        if not positions:
+            return "📭 No open positions."
+        lines = ["💹 *Floating P&L*\n"]
+        total = 0.0
+        for p in positions:
+            sym = p.get("symbol", p.get("tradableInstrumentId", "?"))
+            side = p.get("side", "?")
+            qty = p.get("qty", p.get("volume", "?"))
+            pl = p.get("pl", p.get("unrealizedPL", p.get("profit", None)))
+            pl_str = f"`${float(pl):.2f}`" if isinstance(pl, (int, float)) else "`N/A`"
+            if isinstance(pl, (int, float)):
+                total += float(pl)
+            lines.append(f"• `{sym}` {side} {qty} lots — {pl_str}")
+        lines.append(f"\n*Total: `${total:.2f}`*")
+        return "\n".join(lines)
+
+    def _force_rescan(self):
+        try:
+            self._scan_smc_all()
+            self._scan_gbpjpy()
+            self._notify("✅ Rescan complete.")
+        except Exception as e:
+            self._notify(f"⚠️ Rescan error: {e}")
 
     # ── Scan helpers ──────────────────────────────────────────────────────────
 
