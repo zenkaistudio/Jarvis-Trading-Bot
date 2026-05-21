@@ -129,8 +129,25 @@ def get_trendlines(df: pd.DataFrame) -> dict:
 
 # ── Demand / Supply Zones ─────────────────────────────────────────────────────
 
+def _dedupe_zones(zones: list) -> list:
+    """Remove duplicate zones that overlap significantly."""
+    unique = []
+    for z in zones:
+        overlap = any(
+            abs(z["top"] - u["top"]) / z["top"] < 0.001 and
+            abs(z["bottom"] - u["bottom"]) / z["bottom"] < 0.001
+            for u in unique
+        )
+        if not overlap:
+            unique.append(z)
+    return unique
+
+
 def find_demand_zones(df: pd.DataFrame, lookback: int = 150) -> list:
-    """Demand zone = last bearish candle before an aggressive bullish impulse (unmitigated)."""
+    """
+    Demand zone = last bearish candle before an aggressive bullish impulse.
+    Mitigated only when price CLOSES below zone bottom (full penetration, not just a wick touch).
+    """
     df = df.tail(lookback).reset_index(drop=True)
     avg_body = (df["close"] - df["open"]).abs().mean()
     zones = []
@@ -152,16 +169,20 @@ def find_demand_zones(df: pd.DataFrame, lookback: int = 150) -> list:
         if z_top <= z_bot:
             continue
 
+        # Mitigated = price CLOSED below zone bottom (not just a wick through the top)
         future = df.iloc[i + 1:]
-        mitigated = any(row["low"] <= z_top for _, row in future.iterrows())
+        mitigated = any(row["close"] < z_bot for _, row in future.iterrows())
         if not mitigated:
             zones.append({"type": "demand", "top": z_top, "bottom": z_bot, "time": str(base["time"])})
 
-    return zones[-3:]
+    return _dedupe_zones(zones)[-3:]
 
 
 def find_supply_zones(df: pd.DataFrame, lookback: int = 150) -> list:
-    """Supply zone = last bullish candle before an aggressive bearish impulse (unmitigated)."""
+    """
+    Supply zone = last bullish candle before an aggressive bearish impulse.
+    Mitigated only when price CLOSES above zone top.
+    """
     df = df.tail(lookback).reset_index(drop=True)
     avg_body = (df["close"] - df["open"]).abs().mean()
     zones = []
@@ -183,12 +204,13 @@ def find_supply_zones(df: pd.DataFrame, lookback: int = 150) -> list:
         if z_top <= z_bot:
             continue
 
+        # Mitigated = price CLOSED above zone top
         future = df.iloc[i + 1:]
-        mitigated = any(row["high"] >= z_bot for _, row in future.iterrows())
+        mitigated = any(row["close"] > z_top for _, row in future.iterrows())
         if not mitigated:
             zones.append({"type": "supply", "top": z_top, "bottom": z_bot, "time": str(base["time"])})
 
-    return zones[-3:]
+    return _dedupe_zones(zones)[-3:]
 
 
 # ── Fair Value Gap ────────────────────────────────────────────────────────────
@@ -257,7 +279,34 @@ def calculate_rr(entry: float, sl: float, tp: float) -> float:
 
 # ── Full SMC Scan ─────────────────────────────────────────────────────────────
 
-def _build_setups(df_1h, fvgs, vwap_data, trendlines, direction, zones, opposing, trade_type="TREND"):
+def _valid_fvgs_for_direction(fvgs: list, direction: str, current_price: float) -> list:
+    """
+    Filter FVGs to only those that make sense as entries given current price.
+    LONG entry (bullish FVG): FVG must be BELOW current price (waiting for retracement down).
+    SHORT entry (bearish FVG): FVG must be ABOVE current price (waiting for retracement up).
+    """
+    if direction == "LONG":
+        return [f for f in fvgs if f["type"] == "bullish" and f["fvb"] < current_price]
+    else:
+        return [f for f in fvgs if f["type"] == "bearish" and f["fvb"] > current_price]
+
+
+def _valid_tp(opposing: list, direction: str, current_price: float, entry: float, sl: float) -> float:
+    """
+    Pick the nearest opposing zone that is beyond current price (not already passed).
+    Falls back to 4R target if no valid zone found.
+    """
+    if direction == "LONG":
+        # TP must be above current price for a long
+        valid = [z for z in opposing if z["bottom"] > current_price]
+        return valid[0]["bottom"] if valid else round(entry + abs(entry - sl) * 4, 5)
+    else:
+        # TP must be below current price for a short
+        valid = [z for z in opposing if z["top"] < current_price]
+        return valid[-1]["top"] if valid else round(entry - abs(sl - entry) * 4, 5)
+
+
+def _build_setups(df_1h, fvgs, vwap_data, trendlines, direction, zones, opposing, trade_type="TREND", current_price=None):
     """
     Shared setup builder for both trend and scalp directions.
     trade_type: 'TREND' (with structure) or 'SCALP' (counter-trend, stricter R:R)
@@ -268,15 +317,25 @@ def _build_setups(df_1h, fvgs, vwap_data, trendlines, direction, zones, opposing
         (direction == "LONG" and vwap_data["bias"] == "bullish") or
         (direction == "SHORT" and vwap_data["bias"] == "bearish")
     )
+
+    # Only use FVGs that are on the correct side of current price
+    valid_fvgs = _valid_fvgs_for_direction(fvgs, direction, current_price) if current_price else fvgs
     setups = []
 
     for zone in zones:
+        # Zone must also be on the correct side of current price
+        if current_price:
+            if direction == "LONG" and zone["top"] >= current_price:
+                continue  # demand zone above current price — price already past it
+            if direction == "SHORT" and zone["bottom"] <= current_price:
+                continue  # supply zone below current price — price already past it
+
         sweep = check_liquidity_sweep(df_1h, zone)
         if not sweep["occurred"]:
             continue
 
         fvg_in_zone = next(
-            (f for f in fvgs if zone["bottom"] <= f["fvb"] <= zone["top"]),
+            (f for f in valid_fvgs if zone["bottom"] <= f["fvb"] <= zone["top"]),
             None,
         )
         if not fvg_in_zone:
@@ -285,11 +344,23 @@ def _build_setups(df_1h, fvgs, vwap_data, trendlines, direction, zones, opposing
         if direction == "LONG":
             entry = fvg_in_zone["fvl"]
             sl = sweep.get("sweep_low", round(zone["bottom"] * 0.9997, 5))
-            tp = opposing[-1]["bottom"] if opposing else round(entry + (entry - sl) * 4, 5)
         else:
             entry = fvg_in_zone["fvh"]
             sl = sweep.get("sweep_high", round(zone["top"] * 1.0003, 5))
-            tp = opposing[-1]["top"] if opposing else round(entry - (sl - entry) * 4, 5)
+
+        # TP must be beyond current price, not already passed
+        tp = _valid_tp(opposing, direction, current_price or entry, entry, sl) if current_price else (
+            opposing[-1]["bottom"] if opposing and direction == "LONG" else
+            opposing[-1]["top"] if opposing else
+            round(entry + abs(entry - sl) * 4, 5)
+        )
+
+        # Final sanity check: entry must be below price for LONG, above for SHORT
+        if current_price:
+            if direction == "LONG" and entry >= current_price:
+                continue
+            if direction == "SHORT" and entry <= current_price:
+                continue
 
         rr = calculate_rr(entry, sl, tp)
         if rr < min_rr:
@@ -341,6 +412,7 @@ def run_smc_scan(symbol: str, client) -> dict:
 
     demand_zones = find_demand_zones(df_1h)
     supply_zones = find_supply_zones(df_1h)
+    current_price = df_1h["close"].iloc[-1]
 
     valid_setups = []
 
@@ -355,20 +427,16 @@ def run_smc_scan(symbol: str, client) -> dict:
         }
 
     if structure == "bullish":
-        # Trend: LONG from demand zones
         valid_setups += _build_setups(df_1h, fvgs, vwap_data, trendlines,
-                                       "LONG", demand_zones, supply_zones, "TREND")
-        # Scalp: SHORT from supply zones (counter-trend)
+                                       "LONG", demand_zones, supply_zones, "TREND", current_price)
         valid_setups += _build_setups(df_1h, fvgs, vwap_data, trendlines,
-                                       "SHORT", supply_zones, demand_zones, "SCALP")
+                                       "SHORT", supply_zones, demand_zones, "SCALP", current_price)
 
     elif structure == "bearish":
-        # Trend: SHORT from supply zones
         valid_setups += _build_setups(df_1h, fvgs, vwap_data, trendlines,
-                                       "SHORT", supply_zones, demand_zones, "TREND")
-        # Scalp: LONG from demand zones (counter-trend)
+                                       "SHORT", supply_zones, demand_zones, "TREND", current_price)
         valid_setups += _build_setups(df_1h, fvgs, vwap_data, trendlines,
-                                       "LONG", demand_zones, supply_zones, "SCALP")
+                                       "LONG", demand_zones, supply_zones, "SCALP", current_price)
 
     trend_count = sum(1 for s in valid_setups if s["trade_type"] == "TREND")
     scalp_count = sum(1 for s in valid_setups if s["trade_type"] == "SCALP")
