@@ -63,6 +63,11 @@ HELP_TEXT = """
 `add EURUSD` — add symbol to scan watchlist
 `remove EURUSD` — remove symbol from scan watchlist
 
+*Manual Orders*
+`buy GBPJPY 213.50` — place pending long at that price
+`sell NAS100 29300` — place pending short at that price
+`buy GBPJPY 213.50 sl 212.80` — with custom stop loss
+
 *Auto-Trading*
 `auto on` — enable auto order placement
 `auto off` — disable (alerts only)
@@ -183,14 +188,17 @@ class JarvisMonitor:
         for symbol in config.get("watchlist", WATCHLIST):
             try:
                 result = run_smc_scan(symbol, self.client)
+                try:
+                    current_price = self.client.get_tick(symbol)["price"]
+                except Exception:
+                    current_price = None
                 for smc_setup in result.get("valid_setups", []):
                     key = f"{symbol}_{smc_setup['direction']}_{smc_setup['entry']}"
                     if key not in self._alerted_setups:
                         self._alerted_setups.add(key)
                         self._notify(format_smc_alert(symbol, result["structure"], smc_setup))
-                        # Auto-watch the levels
                         watched = setup_from_smc(result, smc_setup)
-                        self.watcher.add(watched)
+                        self.watcher.add(watched, current_price)
             except Exception as e:
                 print(f"[Jarvis] Error scanning {symbol}: {e}")
 
@@ -305,6 +313,9 @@ class JarvisMonitor:
             if any(w in text for w in ("scan all", "all symbols", "all pairs")):
                 self._notify("🔍 Scanning all symbols... ~30 seconds.")
                 return self._do_watchlist_scan()
+
+            if any(text.startswith(w + " ") for w in ("buy", "sell", "long", "short")):
+                return self._do_manual_order(text)
 
             if any(w in text for w in ("confluence", "kj")) or (
                 any(w in text for w in ("gbpjpy", "gj", "guppy")) and "scan" not in text
@@ -487,6 +498,35 @@ class JarvisMonitor:
         lines.append(f"\n*Total: `${total:.2f}`*")
         return "\n".join(lines)
 
+    def _do_manual_order(self, text: str) -> str:
+        parts = text.split()
+        direction = "LONG" if parts[0] in ("buy", "long") else "SHORT"
+        symbol = _parse_symbol(text)
+        if not symbol:
+            return "❓ Usage: `buy GBPJPY 213.50` or `sell NAS100 29300`"
+        entry = None
+        for p in parts[1:]:
+            try:
+                entry = float(p)
+                break
+            except ValueError:
+                continue
+        if entry is None:
+            return "❓ Couldn't read entry price. Usage: `buy GBPJPY 213.50`"
+        sl = None
+        if "sl" in parts:
+            try:
+                sl = float(parts[parts.index("sl") + 1])
+            except Exception:
+                pass
+        sl_note = ""
+        if sl is None:
+            sl_pct = 0.005
+            sl = round(entry * (1 - sl_pct), 5) if direction == "LONG" else round(entry * (1 + sl_pct), 5)
+            sl_note = "\n\n_Default SL at 0.5% — edit in TradeLocker._"
+        result = self.executor.place_order(symbol, direction, entry, sl, tp=None)
+        return self.executor.format_order_result(result) + sl_note
+
     def _force_rescan(self):
         try:
             self._scan_smc_all()
@@ -508,9 +548,12 @@ class JarvisMonitor:
                 f"_Jarvis will alert when conditions align._"
             )
         top = result["valid_setups"][0]
-        # Auto-watch the levels
+        try:
+            current_price = self.client.get_tick(symbol)["price"]
+        except Exception:
+            current_price = None
         watched = setup_from_smc(result, top)
-        self.watcher.add(watched)
+        self.watcher.add(watched, current_price)
         return (
             format_smc_alert(symbol, result["structure"], top) +
             "\n\n👁 _Jarvis is now watching these levels._"
@@ -523,8 +566,12 @@ class JarvisMonitor:
                 result = run_smc_scan(symbol, self.client)
                 if result.get("valid_setups"):
                     top = result["valid_setups"][0]
+                    try:
+                        current_price = self.client.get_tick(symbol)["price"]
+                    except Exception:
+                        current_price = None
                     watched = setup_from_smc(result, top)
-                    self.watcher.add(watched)
+                    self.watcher.add(watched, current_price)
                     found.append(f"• *{symbol}* {top['direction']} — Entry `{top['entry']}` | R:R `{top['rr']}:1`")
             except Exception:
                 continue

@@ -42,7 +42,7 @@ class WatchedSetup:
         """Price blew past the zone without the user entering."""
         if self.status != "waiting":
             return False
-        return price > self.entry_top * 1.002 if self.direction == "LONG" else price < self.entry_bottom * 0.998
+        return price > self.entry_top * 1.005 if self.direction == "LONG" else price < self.entry_bottom * 0.995
 
     def neckline_broken(self, price: float) -> bool:
         if not self.neckline:
@@ -137,7 +137,16 @@ class SetupWatcher:
     def __init__(self):
         self._setups: dict[str, WatchedSetup] = {}
 
-    def add(self, setup: WatchedSetup):
+    def add(self, setup: WatchedSetup, current_price: float = None):
+        if current_price is not None:
+            already_passed = (
+                setup.direction == "LONG" and current_price > setup.entry_top * 1.005
+            ) or (
+                setup.direction == "SHORT" and current_price < setup.entry_bottom * 0.995
+            )
+            if already_passed:
+                print(f"[Jarvis] Skipped stale setup (price already past zone): {setup.id}")
+                return
         self._setups[setup.id] = setup
         print(f"[Jarvis] Watching: {setup.id}")
 
