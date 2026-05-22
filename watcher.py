@@ -216,14 +216,14 @@ class SetupWatcher:
             setup.alerts_fired.add("missed")
             msgs.append(fmt_missed_entry(setup, price))
 
-        # TP approaching (can fire alongside other alerts)
-        if setup.tp_approaching(price) and "tp" not in setup.alerts_fired:
+        # TP approaching — only fires if we're actually in the trade
+        if setup.status == "entered" and setup.tp_approaching(price) and "tp" not in setup.alerts_fired:
             setup.status = "tp_hit"
             setup.alerts_fired.add("tp")
             msgs.append(fmt_tp_approaching(setup, price))
 
-        # Neckline broken (GBPJPY IH&S)
-        if setup.neckline_broken(price) and "neckline" not in setup.alerts_fired:
+        # Neckline broken — only fires if we're in the trade
+        if setup.status == "entered" and setup.neckline_broken(price) and "neckline" not in setup.alerts_fired:
             setup.alerts_fired.add("neckline")
             msgs.append(fmt_neckline_break(setup, price))
 
