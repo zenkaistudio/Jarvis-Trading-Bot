@@ -28,7 +28,7 @@ LIVE_INSTRUMENTS = {
     "EURUSD": {"tradableInstrumentId": 3470, "route_trade": 509994, "route_info": 509043},
     "GBPJPY": {"tradableInstrumentId": 3474, "route_trade": 509994, "route_info": 509043},
     "XAUUSD": {"tradableInstrumentId": 3366, "route_trade": 509994, "route_info": 509043},
-    "NAS100": {"tradableInstrumentId": 3373, "route_trade": 509994, "route_info": 509043},
+    "NAS100": {"tradableInstrumentId": 3884, "route_trade": 509994, "route_info": 509043},
     "NZDJPY": {"tradableInstrumentId": 3483, "route_trade": 509994, "route_info": 509043},
     "AUDCAD": {"tradableInstrumentId": 3510, "route_trade": 509994, "route_info": 509043},
 }
