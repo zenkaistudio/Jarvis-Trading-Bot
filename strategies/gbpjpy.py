@@ -8,7 +8,7 @@ Minimum 5/10 confluences required before flagging a setup.
 import numpy as np
 import pandas as pd
 
-from .smc import _pivot_highs, _pivot_lows, calculate_vwap, get_trendlines
+from .smc import _pivot_highs, _pivot_lows, calculate_vwap, get_trendlines, find_supply_zones
 
 
 SYMBOL = "GBPJPY"
@@ -198,6 +198,7 @@ def get_1h_entry(df_1h: pd.DataFrame, zone_level: float, pattern_info: dict) -> 
     Entry = right shoulder low or zone retest on 1H.
     Scale: largest lots at zone bottom, smaller higher up.
     SL = below lowest wick of full consolidation.
+    TP = nearest unmitigated supply zone above current price, fallback 3:1 R:R.
     """
     pl = _pivot_lows(df_1h, left=2, right=2)
     zone_pivots = [p for p in pl if abs(p["price"] - zone_level) / zone_level < 0.025]
@@ -209,14 +210,29 @@ def get_1h_entry(df_1h: pd.DataFrame, zone_level: float, pattern_info: dict) -> 
     if zone_pivots:
         entry_zone_bottom = round(min(p["price"] for p in zone_pivots[-3:]), 3)
         entry_zone_top = round(max(p["price"] for p in zone_pivots[-3:]), 3)
-        risk_pips = round((current_price - sl) * 100, 1)
     else:
         entry_zone_bottom = round(zone_level * 0.998, 3)
         entry_zone_top = round(zone_level * 1.002, 3)
-        risk_pips = round((current_price - sl) * 100, 1)
+
+    risk_pips = round((current_price - sl) * 100, 1)
+    risk = entry_zone_bottom - sl
+
+    # TP: nearest supply zone above current price, else 3:1 R:R fallback
+    supply_zones = find_supply_zones(df_1h)
+    valid_supplies = [z for z in supply_zones if z["bottom"] > current_price]
+    if valid_supplies:
+        tp = round(valid_supplies[0]["bottom"], 3)
+    else:
+        tp = round(entry_zone_bottom + abs(risk) * 3, 3)
 
     position_in_zone = "bottom" if current_price < zone_level * 1.005 else "upper" if current_price > zone_level * 1.015 else "mid"
-    lot_guidance = {"bottom": "Largest lot size", "mid": "Medium lot size", "upper": "Smallest lots only"}
+    lot_guidance = {
+        "bottom": "Best entry — full 2% risk allocation",
+        "mid": "Mid-zone — use half your intended size",
+        "upper": "Top of zone — small entry only, wait for better price",
+    }
+
+    rr = round(abs(tp - entry_zone_bottom) / abs(risk), 2) if risk != 0 else 0.0
 
     # VWAP and trendline from 1H
     vwap = calculate_vwap(df_1h)
@@ -226,6 +242,8 @@ def get_1h_entry(df_1h: pd.DataFrame, zone_level: float, pattern_info: dict) -> 
     return {
         "entry_zone": f"{entry_zone_bottom} — {entry_zone_top}",
         "sl": sl,
+        "tp": tp,
+        "rr": rr,
         "risk_pips": risk_pips,
         "position_in_zone": position_in_zone,
         "lot_guidance": lot_guidance[position_in_zone],
