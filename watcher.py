@@ -286,6 +286,38 @@ def setup_from_smc(scan_result: dict, smc_setup: dict) -> WatchedSetup:
     )
 
 
+def setup_from_kj(result: dict) -> Optional[WatchedSetup]:
+    """Build WatchedSetup from run_kj_confluence_check result — any symbol, LONG or SHORT."""
+    if not result.get("setup_valid"):
+        return None
+    symbol = result["symbol"]
+    direction = result["direction"]
+    entry_info = result.get("1h_entry", {})
+    reversal = result.get("4h_reversal", {})
+    sl = entry_info.get("sl")
+    tp = entry_info.get("tp")
+    try:
+        parts = entry_info.get("entry_zone", "").replace(" ", "").split("—")
+        entry_bottom = float(parts[0])
+        entry_top = float(parts[1])
+    except Exception:
+        return None
+    neckline = reversal.get("neckline") if reversal.get("pattern") in (
+        "Inverse Head & Shoulders", "Head & Shoulders"
+    ) else None
+    return WatchedSetup(
+        id=f"{symbol}_{direction}_{entry_bottom}_kj",
+        symbol=symbol,
+        direction=direction,
+        setup_type="kj",
+        entry_top=float(entry_top),
+        entry_bottom=float(entry_bottom),
+        sl=float(sl) if sl else entry_bottom * (0.999 if direction == "LONG" else 1.001),
+        tp=float(tp) if tp else None,
+        neckline=float(neckline) if neckline else None,
+    )
+
+
 def setup_from_gbpjpy(confluence_result: dict) -> Optional[WatchedSetup]:
     if not confluence_result.get("setup_valid") in (True, "True"):
         return None
@@ -295,6 +327,7 @@ def setup_from_gbpjpy(confluence_result: dict) -> Optional[WatchedSetup]:
 
     entry_zone_str = entry_info.get("entry_zone", "")
     sl = entry_info.get("sl")
+    tp = entry_info.get("tp")
 
     try:
         parts = entry_zone_str.replace(" ", "").split("—")
@@ -313,6 +346,6 @@ def setup_from_gbpjpy(confluence_result: dict) -> Optional[WatchedSetup]:
         entry_top=float(entry_top),
         entry_bottom=float(entry_bottom),
         sl=float(sl) if sl else entry_bottom * 0.999,
-        tp=None,
+        tp=float(tp) if tp else None,
         neckline=float(neckline) if neckline else None,
     )

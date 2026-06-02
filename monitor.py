@@ -6,9 +6,9 @@ from pathlib import Path
 import requests
 
 from notifier import send_telegram, format_smc_alert, format_gbpjpy_alert
-from strategies.smc import run_smc_scan
-from strategies.gbpjpy import run_gbpjpy_confluence_check
-from watcher import SetupWatcher, setup_from_smc, setup_from_gbpjpy
+from strategies.smc import run_smc_scan, run_range_scan
+from strategies.gbpjpy import run_gbpjpy_confluence_check, run_kj_confluence_check
+from watcher import SetupWatcher, setup_from_smc, setup_from_gbpjpy, setup_from_kj
 from order_executor import OrderExecutor
 
 JARVIS_CONFIG_PATH = Path(__file__).parent / "jarvis_config.json"
@@ -51,9 +51,13 @@ HELP_TEXT = """
 `bias GBPJPY` — quick directional bias (structure + VWAP)
 
 *Analysis*
-`scan GBPJPY` — full SMC scan + auto-watch levels
-`scan all` — scan entire watchlist
-`gbpjpy` — full KJ confluence check + auto-watch levels
+`scan GBPJPY` — SMC + KJ scan for any pair + auto-watch levels
+`kj GBPJPY` — full top-down KJ confluence check (any pair)
+`scalp GBPJPY` — counter-trend scalp setups only (R:R ≥ 2:1)
+`range GBPJPY` — range-bound setups: buy support, sell resistance
+`scan all` — scan entire watchlist (SMC)
+`rate all` — KJ confluence rating for every pair at once
+`gbpjpy` — original KJ check (GBPJPY specific)
 `rescan` — force immediate rescan right now
 
 *Watchlist*
@@ -74,6 +78,11 @@ HELP_TEXT = """
 `risk 2` — set risk % per trade (0.5–5%)
 `mode demo` — trade on demo account
 `mode live` — trade on live account
+
+*Entry Timeframe*
+`tf 5m` — use 5-minute candles for entries
+`tf 15m` — use 15-minute candles for entries
+`tf 1h` — use 1-hour candles for entries
 
 *Monitoring*
 `start` — start background alerts
@@ -178,16 +187,17 @@ class JarvisMonitor:
             except Exception as e:
                 print(f"[Jarvis] SMC scan error: {e}")
             try:
-                self._scan_gbpjpy()
+                self._scan_kj_all()
             except Exception as e:
-                print(f"[Jarvis] GBPJPY scan error: {e}")
+                print(f"[Jarvis] KJ scan error: {e}")
             time.sleep(interval_minutes * 60)
 
     def _scan_smc_all(self):
         config = self._load_config()
+        entry_tf = config.get("entry_timeframe", "15m")
         for symbol in config.get("watchlist", WATCHLIST):
             try:
-                result = run_smc_scan(symbol, self.client)
+                result = run_smc_scan(symbol, self.client, entry_tf=entry_tf)
                 try:
                     current_price = self.client.get_tick(symbol)["price"]
                 except Exception:
@@ -202,19 +212,47 @@ class JarvisMonitor:
             except Exception as e:
                 print(f"[Jarvis] Error scanning {symbol}: {e}")
 
-    def _scan_gbpjpy(self):
+    def _scan_kj_all(self):
+        """Run KJ confluence check on all watchlist pairs. Alert when score ≥ threshold."""
         config = self._load_config()
         threshold = config.get("gbpjpy_alert_threshold", 5)
-        result = run_gbpjpy_confluence_check(self.client)
-        score = int(result.get("confluence_score", "0/10").split("/")[0])
-        if score >= threshold and score > self._alerted_gbpjpy_score:
-            self._alerted_gbpjpy_score = score
-            self._notify(format_gbpjpy_alert(result))
-            watched = setup_from_gbpjpy(result)
-            if watched:
-                self.watcher.add(watched)
-        elif score < threshold:
-            self._alerted_gbpjpy_score = 0
+        for symbol in config.get("watchlist", WATCHLIST):
+            try:
+                if symbol == "GBPJPY":
+                    # Use original GBPJPY-specific strategy for this pair
+                    result = run_gbpjpy_confluence_check(self.client)
+                    score = int(result.get("confluence_score", "0/10").split("/")[0])
+                    if score >= threshold and score > self._alerted_gbpjpy_score:
+                        self._alerted_gbpjpy_score = score
+                        self._notify(format_gbpjpy_alert(result))
+                        watched = setup_from_gbpjpy(result)
+                        if watched:
+                            self.watcher.add(watched)
+                    elif score < threshold:
+                        self._alerted_gbpjpy_score = 0
+                else:
+                    result = run_kj_confluence_check(symbol, self.client)
+                    score = result.get("raw_score", 0)
+                    direction = result.get("direction", "?")
+                    if result.get("setup_valid") and score >= threshold:
+                        entry = result.get("1h_entry", {})
+                        reversal = result.get("4h_reversal", {})
+                        msg = (
+                            f"🎯 *{symbol} KJ Setup — {score}/10*\n\n"
+                            f"Direction: *{direction}*\n"
+                            f"Pattern: `{reversal.get('pattern', 'None')}`\n"
+                            f"Entry: `{entry.get('entry_zone', 'N/A')}`\n"
+                            f"SL: `{entry.get('sl', 'N/A')}`\n"
+                            f"TP: `{entry.get('tp', 'N/A')}`\n"
+                            f"R:R: `{entry.get('rr', 'N/A')}:1`\n\n"
+                            f"_{result.get('message', '')}_"
+                        )
+                        self._notify(msg)
+                        watched = setup_from_kj(result)
+                        if watched:
+                            self.watcher.add(watched)
+            except Exception as e:
+                print(f"[Jarvis] KJ scan error {symbol}: {e}")
 
     # ── Telegram Chat Loop ────────────────────────────────────────────────────
 
@@ -311,8 +349,8 @@ class JarvisMonitor:
                 return "🔄 Forcing rescan now... You'll get alerts if setups are found."
 
             if any(w in text for w in ("scan all", "all symbols", "all pairs")):
-                self._notify("🔍 Scanning all symbols... ~30 seconds.")
-                return self._do_watchlist_scan()
+                threading.Thread(target=self._bg_watchlist_scan, daemon=True).start()
+                return "🔍 Scanning all 6 pairs in background. Results incoming per symbol."
 
             if any(text.startswith(w + " ") for w in ("buy", "sell", "long", "short")):
                 return self._do_manual_order(text)
@@ -345,11 +383,48 @@ class JarvisMonitor:
                     f"Pattern: `{reversal.get('pattern', 'None detected')}`\n"
                     f"Entry Zone: `{entry.get('entry_zone', 'N/A')}`\n"
                     f"Stop Loss: `{entry.get('sl', 'N/A')}`\n"
+                    f"Take Profit: `{entry.get('tp', 'N/A')}`\n"
+                    f"R:R: `{entry.get('rr', 'N/A')}:1`\n"
                     f"Neckline: `{reversal.get('neckline', 'N/A')}`\n"
                     f"Lot Guidance: `{entry.get('lot_guidance', 'N/A')}`\n\n"
                     f"_{result.get('message', '')}_"
                     f"{watch_note}"
                 )
+
+            if text.startswith("tf"):
+                parts = text.split()
+                valid_tfs = {"5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "1H": "1H"}
+                raw = parts[1].lower() if len(parts) > 1 else ""
+                tf = valid_tfs.get(raw) or valid_tfs.get(raw.upper())
+                if not tf:
+                    return "❓ Valid options: `tf 5m`, `tf 15m`, `tf 30m`, `tf 1h`"
+                self._load_and_set("entry_timeframe", tf)
+                return f"✅ Entry timeframe set to `{tf}`.\n_All scans will now use {tf} candles for FVG + sweep detection._"
+
+            if text.startswith("kj") or text.startswith("confluence "):
+                symbol = _parse_symbol(text)
+                if not symbol:
+                    return "❓ Usage: `kj GBPJPY` or `kj gold`"
+                self._notify(f"🔍 Running KJ confluence check: {symbol}...")
+                return self._do_kj_check(symbol)
+
+            if any(text.startswith(w) for w in ("rate", "ratings", "rating")):
+                threading.Thread(target=self._bg_ratings_all, daemon=True).start()
+                return "📊 Running KJ ratings on all pairs... results incoming."
+
+            if text.startswith("scalp"):
+                symbol = _parse_symbol(text)
+                if not symbol:
+                    return "❓ Usage: `scalp GBPJPY`"
+                self._notify(f"⚡ Scalp scan: {symbol}...")
+                return self._do_scalp_scan(symbol)
+
+            if text.startswith("range"):
+                symbol = _parse_symbol(text)
+                if not symbol:
+                    return "❓ Usage: `range GBPJPY`"
+                self._notify(f"📊 Range scan: {symbol}...")
+                return self._do_range_scan(symbol)
 
             symbol = _parse_symbol(text)
             if "scan" in text or symbol:
@@ -424,10 +499,13 @@ class JarvisMonitor:
 
             if "status" in text:
                 s = self.status()
+                config = self._load_config()
+                entry_tf = config.get("entry_timeframe", "15m")
                 return (
                     f"⚙️ *Jarvis Status*\n\n"
                     f"Monitoring: `{'ON' if s['running'] else 'OFF'}`\n"
                     f"Interval: `{s['interval_minutes']} min`\n"
+                    f"Entry Timeframe: `{entry_tf}`\n"
                     f"Watched setups: `{s['watched_setups']}`\n"
                     f"Watchlist: `{', '.join(s['watchlist'])}`"
                 )
@@ -530,7 +608,7 @@ class JarvisMonitor:
     def _force_rescan(self):
         try:
             self._scan_smc_all()
-            self._scan_gbpjpy()
+            self._scan_kj_all()
             self._notify("✅ Rescan complete.")
         except Exception as e:
             self._notify(f"⚠️ Rescan error: {e}")
@@ -538,14 +616,36 @@ class JarvisMonitor:
     # ── Scan helpers ──────────────────────────────────────────────────────────
 
     def _do_smc_scan(self, symbol: str) -> str:
-        result = run_smc_scan(symbol, self.client)
+        entry_tf = self._load_config().get("entry_timeframe", "15m")
+        result = run_smc_scan(symbol, self.client, entry_tf=entry_tf)
+
+        # Run KJ check in parallel for combined rating
+        kj_line = ""
+        try:
+            kj = run_kj_confluence_check(symbol, self.client)
+            kj_score = kj.get("raw_score", 0)
+            kj_dir = kj.get("direction", "?")
+            kj_valid = kj.get("setup_valid", False)
+            kj_line = (
+                f"\n\n📐 *KJ Score: `{kj.get('confluence_score', '?/10')}`* — {kj_dir} "
+                f"{'✅' if kj_valid else '⏳'}"
+                f"\n_Type `kj {symbol}` for full top-down breakdown._"
+            )
+            if kj_valid:
+                watched_kj = setup_from_kj(kj)
+                if watched_kj:
+                    self.watcher.add(watched_kj)
+        except Exception:
+            pass
+
         if not result.get("valid_setups"):
             return (
-                f"🔍 *{symbol} SMC Scan*\n\n"
-                f"Structure: `{result.get('structure', 'N/A').upper()}`\n"
+                f"🔍 *{symbol} Scan*\n\n"
+                f"4H Structure: `{result.get('structure', 'N/A').upper()}`\n"
                 f"VWAP Bias: `{result.get('vwap', {}).get('bias', 'N/A')}`\n\n"
-                f"No valid setup — checklist incomplete.\n"
+                f"SMC: No valid setup — checklist incomplete.\n"
                 f"_Jarvis will alert when conditions align._"
+                + kj_line
             )
         top = result["valid_setups"][0]
         try:
@@ -554,16 +654,183 @@ class JarvisMonitor:
             current_price = None
         watched = setup_from_smc(result, top)
         self.watcher.add(watched, current_price)
+        entry_tf = result.get("entry_tf", "15m")
         return (
             format_smc_alert(symbol, result["structure"], top) +
+            f"\nEntry TF: `{entry_tf}`" +
             "\n\n👁 _Jarvis is now watching these levels._"
+            + kj_line
         )
 
+    def _do_kj_check(self, symbol: str) -> str:
+        result = run_kj_confluence_check(symbol, self.client)
+        score = result.get("raw_score", 0)
+        direction = result.get("direction", "?")
+        valid = result.get("setup_valid", False)
+        entry = result.get("1h_entry", {})
+        reversal = result.get("4h_reversal", {})
+        key = result.get("key_level", {})
+        checklist = result.get("checklist", {})
+
+        stars = "⭐" * min(5, max(1, round(score / 2)))
+        status = "✅ SETUP VALID" if valid else "⏳ Not ready"
+
+        check_lines = "\n".join(
+            f"{'✅' if v else '❌'} {k.replace('_', ' ').title()}"
+            for k, v in checklist.items()
+        )
+
+        reply = (
+            f"🎯 *{symbol} KJ Confluence — {direction}*\n\n"
+            f"Score: *{result.get('confluence_score')}* {stars} — {status}\n"
+            f"Key Level: `{key.get('signal', 'N/A')}`\n"
+            f"Pattern: `{reversal.get('pattern', 'None')}`\n\n"
+            f"Entry Zone: `{entry.get('entry_zone', 'N/A')}`\n"
+            f"Stop Loss: `{entry.get('sl', 'N/A')}`\n"
+            f"Take Profit: `{entry.get('tp', 'N/A')}`\n"
+            f"R:R: `{entry.get('rr', 'N/A')}:1`\n\n"
+            f"*Checklist:*\n{check_lines}\n\n"
+            f"_{result.get('message', '')}_"
+        )
+
+        if valid:
+            watched = setup_from_kj(result)
+            if watched:
+                self.watcher.add(watched)
+                reply += "\n\n👁 _Jarvis is watching these levels._"
+
+        return reply
+
+    def _bg_ratings_all(self):
+        """Run KJ confluence on all pairs and send a combined rating table."""
+        config = self._load_config()
+        watchlist = config.get("watchlist", WATCHLIST)
+        entry_tf = config.get("entry_timeframe", "15m")
+        rows = []
+        best_score = -1
+        best_sym = ""
+        best_dir = ""
+
+        def _stars(combined: int) -> str:
+            if combined >= 12: return "⭐⭐⭐⭐⭐"
+            if combined >= 9:  return "⭐⭐⭐⭐"
+            if combined >= 6:  return "⭐⭐⭐"
+            if combined >= 3:  return "⭐⭐"
+            return "⭐"
+
+        for symbol in watchlist:
+            try:
+                kj = run_kj_confluence_check(symbol, self.client)
+                smc = run_smc_scan(symbol, self.client, entry_tf=entry_tf)
+                kj_raw = kj.get("raw_score", 0)
+                smc_raw = max((s.get("confluence_score", "0/5").split("/")[0] for s in smc.get("valid_setups", [{"confluence_score": "0/5"}])), default="0")
+                try:
+                    smc_int = int(smc_raw)
+                except Exception:
+                    smc_int = 0
+                combined = kj_raw + smc_int
+                direction = kj.get("direction", "?")
+                valid_tag = "✅" if kj.get("setup_valid") else "·"
+                rows.append(
+                    f"{valid_tag} `{symbol:<7}` {_stars(combined)}  KJ `{kj.get('confluence_score')}` SMC `{smc_int}/5` — {direction}"
+                )
+                if combined > best_score:
+                    best_score = combined
+                    best_sym = symbol
+                    best_dir = direction
+            except Exception as e:
+                rows.append(f"· `{symbol}` — error: {e}")
+
+        table = "\n".join(rows)
+        footer = f"\n\n🥇 *Best:* `{best_sym}` {best_dir} (combined {best_score}/15)" if best_score >= 0 else ""
+        self._notify(
+            f"📊 *Pair Ratings — KJ + SMC*\n\n{table}{footer}\n\n"
+            f"_Type `kj SYMBOL` for full breakdown. Type `scan SYMBOL` for SMC levels._"
+        )
+
+    def _do_scalp_scan(self, symbol: str) -> str:
+        entry_tf = self._load_config().get("entry_timeframe", "15m")
+        result = run_smc_scan(symbol, self.client, entry_tf=entry_tf)
+        scalp_setups = [s for s in result.get("valid_setups", []) if s.get("trade_type") == "SCALP"]
+        if not scalp_setups:
+            return (
+                f"⚡ *{symbol} Scalp Scan*\n\n"
+                f"Structure: `{result.get('structure', 'N/A').upper()}`\n\n"
+                f"No scalp setups right now.\n"
+                f"_Scalp = counter-trend from opposing zone. Needs supply in bullish market or demand in bearish._"
+            )
+        top = scalp_setups[0]
+        try:
+            current_price = self.client.get_tick(symbol)["price"]
+        except Exception:
+            current_price = None
+        watched = setup_from_smc(result, top)
+        self.watcher.add(watched, current_price)
+        return (
+            f"⚡ *{symbol} SCALP Setup*\n\n"
+            f"Direction: *{top['direction']}* (counter-trend)\n"
+            f"Entry: `{top['entry']}`\n"
+            f"Stop Loss: `{top['sl']}`\n"
+            f"Take Profit: `{top['tp']}`\n"
+            f"R:R: `{top['rr']}:1`\n"
+            f"Confluence: `{top.get('confluence_score', 'N/A')}`\n\n"
+            f"_Counter-trend — use smaller size. Higher risk._\n"
+            f"👁 _Jarvis is watching these levels._"
+        )
+
+    def _do_range_scan(self, symbol: str) -> str:
+        entry_tf = self._load_config().get("entry_timeframe", "15m")
+        result = run_range_scan(symbol, self.client, entry_tf=entry_tf)
+        setups = result.get("valid_setups", [])
+        rh = result.get("range_high", "N/A")
+        rl = result.get("range_low", "N/A")
+        if not setups:
+            return (
+                f"📊 *{symbol} Range Scan*\n\n"
+                f"Range: `{rl} — {rh}`\n"
+                f"Structure: `{result.get('structure', 'N/A').upper()}`\n\n"
+                f"No valid range setups — zones too tight or R:R insufficient.\n"
+            )
+        lines = [f"📊 *{symbol} Range Setups*\n\nRange: `{rl} — {rh}`\n"]
+        for s in setups:
+            sweep_note = "✅ sweep confirmed" if s.get("sweep_confirmed") else "⏳ no sweep yet"
+            lines.append(
+                f"*{s['direction']}* — Entry `{s['entry']}` | SL `{s['sl']}` | TP `{s['tp']}` | R:R `{s['rr']}:1` | {sweep_note}"
+            )
+        lines.append("\n_Range trades: buy support, sell resistance. Exit before breakout._")
+        return "\n".join(lines)
+
+    def _bg_watchlist_scan(self):
+        """Background version of watchlist scan — notifies per symbol so the chat loop stays free."""
+        entry_tf = self._load_config().get("entry_timeframe", "15m")
+        found_any = False
+        for symbol in WATCHLIST:
+            try:
+                result = run_smc_scan(symbol, self.client, entry_tf=entry_tf)
+                if result.get("valid_setups"):
+                    top = result["valid_setups"][0]
+                    try:
+                        current_price = self.client.get_tick(symbol)["price"]
+                    except Exception:
+                        current_price = None
+                    watched = setup_from_smc(result, top)
+                    self.watcher.add(watched, current_price)
+                    self._notify(
+                        format_smc_alert(symbol, result["structure"], top) +
+                        f"\nEntry TF: `{entry_tf}`\n👁 _Watching levels._"
+                    )
+                    found_any = True
+            except Exception as e:
+                print(f"[Jarvis] Scan error {symbol}: {e}")
+        if not found_any:
+            self._notify("🔍 *Scan All Complete*\n\nNo valid setups across watchlist right now.")
+
     def _do_watchlist_scan(self) -> str:
+        entry_tf = self._load_config().get("entry_timeframe", "15m")
         found = []
         for symbol in WATCHLIST:
             try:
-                result = run_smc_scan(symbol, self.client)
+                result = run_smc_scan(symbol, self.client, entry_tf=entry_tf)
                 if result.get("valid_setups"):
                     top = result["valid_setups"][0]
                     try:

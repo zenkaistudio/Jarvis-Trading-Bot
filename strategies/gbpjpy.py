@@ -8,7 +8,7 @@ Minimum 5/10 confluences required before flagging a setup.
 import numpy as np
 import pandas as pd
 
-from .smc import _pivot_highs, _pivot_lows, calculate_vwap, get_trendlines, find_supply_zones
+from .smc import _pivot_highs, _pivot_lows, calculate_vwap, get_trendlines, find_supply_zones, find_demand_zones
 
 
 SYMBOL = "GBPJPY"
@@ -331,4 +331,262 @@ def run_gbpjpy_confluence_check(client) -> dict:
             if setup_valid
             else f"Not ready — only {score}/10 confluences (need 5+). Keep monitoring."
         ),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Universal KJ Confluence — works on ANY symbol, both LONG and SHORT
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _find_key_level(df_daily_full: "pd.DataFrame", direction: str) -> dict:
+    """Find the most significant demand (LONG) or supply (SHORT) zone on daily TF."""
+    current_price = df_daily_full["close"].iloc[-1]
+    if direction == "LONG":
+        zones = find_demand_zones(df_daily_full, lookback=500)
+        below = [z for z in zones if z["top"] < current_price]
+        if below:
+            best = min(below, key=lambda z: current_price - z["top"])
+            mid = round((best["top"] + best["bottom"]) / 2, 5)
+            return {"found": True, "zone_level": mid, "zone_top": best["top"],
+                    "zone_bottom": best["bottom"], "current_price": round(current_price, 5),
+                    "signal": f"Daily demand: {best['bottom']}–{best['top']}"}
+    else:
+        zones = find_supply_zones(df_daily_full, lookback=500)
+        above = [z for z in zones if z["bottom"] > current_price]
+        if above:
+            best = min(above, key=lambda z: z["bottom"] - current_price)
+            mid = round((best["top"] + best["bottom"]) / 2, 5)
+            return {"found": True, "zone_level": mid, "zone_top": best["top"],
+                    "zone_bottom": best["bottom"], "current_price": round(current_price, 5),
+                    "signal": f"Daily supply: {best['bottom']}–{best['top']}"}
+    return {"found": False, "zone_level": current_price, "reason": f"No {direction} zone on daily"}
+
+
+def _check_weekly_intent(df_weekly: "pd.DataFrame", zone_level: float, direction: str) -> dict:
+    recent = df_weekly.tail(8)
+    rejection_count = 0
+    directional_closes = 0
+    for _, row in recent.iterrows():
+        ref = row["low"] if direction == "LONG" else row["high"]
+        if abs(ref - zone_level) / zone_level > 0.02:
+            continue
+        body = abs(row["close"] - row["open"])
+        if direction == "LONG":
+            wick = (row["open"] if row["close"] > row["open"] else row["close"]) - row["low"]
+            if wick > body * 0.5:
+                rejection_count += 1
+            if row["close"] > row["open"]:
+                directional_closes += 1
+        else:
+            wick = row["high"] - (row["open"] if row["close"] < row["open"] else row["close"])
+            if wick > body * 0.5:
+                rejection_count += 1
+            if row["close"] < row["open"]:
+                directional_closes += 1
+    score = min(rejection_count + directional_closes, 3)
+    return {
+        "rejection_wicks": rejection_count,
+        "directional_closes": directional_closes,
+        "score": score,
+        "signal": f"{'Buyers' if direction == 'LONG' else 'Sellers'} defending zone" if score >= 2 else "Weak weekly confirmation",
+    }
+
+
+def _check_daily_validation_generic(df_daily: "pd.DataFrame", zone_level: float, direction: str) -> dict:
+    recent = df_daily.tail(20)
+    rejection_closes = 0
+    for _, row in recent.iterrows():
+        if direction == "LONG" and row["low"] < zone_level and row["close"] > zone_level:
+            rejection_closes += 1
+        elif direction == "SHORT" and row["high"] > zone_level and row["close"] < zone_level:
+            rejection_closes += 1
+    atr_recent = (recent["high"] - recent["low"]).tail(5).mean()
+    atr_prior = (recent["high"] - recent["low"]).head(10).mean()
+    size_decreasing = atr_recent < atr_prior * 0.85
+    range_recent = recent["high"].tail(5).max() - recent["low"].tail(5).min()
+    range_prior = recent["high"].head(10).max() - recent["low"].head(10).min()
+    consolidating = range_recent < range_prior * 0.35
+    score = sum([rejection_closes >= 3, size_decreasing, consolidating])
+    return {
+        "rejection_closes": rejection_closes,
+        "candle_size_decreasing": size_decreasing,
+        "consolidating": consolidating,
+        "score": score,
+        "signal": "High-probability base" if score >= 2 else "Zone not yet validated",
+    }
+
+
+def _check_4h_reversal_generic(df_4h: "pd.DataFrame", zone_level: float, direction: str) -> dict:
+    if direction == "LONG":
+        zone_pivots = [p for p in _pivot_lows(df_4h, left=3, right=3)
+                       if abs(p["price"] - zone_level) / zone_level < 0.025]
+        if len(zone_pivots) >= 3:
+            ls, head, rs = zone_pivots[-3], zone_pivots[-2], zone_pivots[-1]
+            if head["price"] < ls["price"] and head["price"] < rs["price"]:
+                neckline = max(
+                    df_4h["high"].iloc[ls["index"]: head["index"]].max(),
+                    df_4h["high"].iloc[head["index"]: rs["index"]].max(),
+                )
+                return {"pattern": "Inverse Head & Shoulders", "neckline": round(neckline, 5),
+                        "neckline_broken": df_4h["close"].iloc[-1] > neckline,
+                        "entry_signal": "Right shoulder low — enter on zone retest", "found": True}
+        if len(zone_pivots) >= 2:
+            b1, b2 = zone_pivots[-2], zone_pivots[-1]
+            if (abs(b1["price"] - b2["price"]) / b1["price"] < 0.005
+                    and df_4h["high"].iloc[b1["index"]: b2["index"]].max() > b1["price"] * 1.002):
+                return {"pattern": "Double Bottom", "found": True, "entry_signal": "Enter on retest", "neckline": None}
+        if len(df_4h) >= 3:
+            c1, c2, c3 = df_4h.iloc[-3], df_4h.iloc[-2], df_4h.iloc[-1]
+            avg_body = (df_4h["close"] - df_4h["open"]).abs().mean()
+            if (c1["close"] < c1["open"] and abs(c1["close"] - c1["open"]) > avg_body
+                    and abs(c2["close"] - c2["open"]) < avg_body * 0.4
+                    and c3["close"] > c3["open"] and abs(c3["close"] - c3["open"]) > avg_body):
+                return {"pattern": "Morning Star", "found": True, "entry_signal": "Bullish reversal forming", "neckline": None}
+    else:
+        zone_pivots = [p for p in _pivot_highs(df_4h, left=3, right=3)
+                       if abs(p["price"] - zone_level) / zone_level < 0.025]
+        if len(zone_pivots) >= 3:
+            ls, head, rs = zone_pivots[-3], zone_pivots[-2], zone_pivots[-1]
+            if head["price"] > ls["price"] and head["price"] > rs["price"]:
+                neckline = min(
+                    df_4h["low"].iloc[ls["index"]: head["index"]].min(),
+                    df_4h["low"].iloc[head["index"]: rs["index"]].min(),
+                )
+                return {"pattern": "Head & Shoulders", "neckline": round(neckline, 5),
+                        "neckline_broken": df_4h["close"].iloc[-1] < neckline,
+                        "entry_signal": "Right shoulder high — enter on zone retest", "found": True}
+        if len(zone_pivots) >= 2:
+            t1, t2 = zone_pivots[-2], zone_pivots[-1]
+            if (abs(t1["price"] - t2["price"]) / t1["price"] < 0.005
+                    and df_4h["low"].iloc[t1["index"]: t2["index"]].min() < t1["price"] * 0.998):
+                return {"pattern": "Double Top", "found": True, "entry_signal": "Enter on zone retest", "neckline": None}
+        if len(df_4h) >= 3:
+            c1, c2, c3 = df_4h.iloc[-3], df_4h.iloc[-2], df_4h.iloc[-1]
+            avg_body = (df_4h["close"] - df_4h["open"]).abs().mean()
+            if (c1["close"] > c1["open"] and abs(c1["close"] - c1["open"]) > avg_body
+                    and abs(c2["close"] - c2["open"]) < avg_body * 0.4
+                    and c3["close"] < c3["open"] and abs(c3["close"] - c3["open"]) > avg_body):
+                return {"pattern": "Evening Star", "found": True, "entry_signal": "Bearish reversal forming", "neckline": None}
+    return {"pattern": None, "found": False, "entry_signal": "No 4H reversal pattern detected", "neckline": None}
+
+
+def _get_1h_entry_generic(df_1h: "pd.DataFrame", zone_level: float, reversal: dict, direction: str) -> dict:
+    current_price = df_1h["close"].iloc[-1]
+    vwap = calculate_vwap(df_1h)
+    vwap_level = round(vwap.iloc[-1], 5)
+    trendlines = get_trendlines(df_1h)
+
+    if direction == "LONG":
+        zone_pivots = [p for p in _pivot_lows(df_1h, left=2, right=2)
+                       if abs(p["price"] - zone_level) / zone_level < 0.025]
+        sl = round(df_1h["low"].tail(50).min() * 0.9995, 5)
+        if zone_pivots:
+            entry_bottom = round(min(p["price"] for p in zone_pivots[-3:]), 5)
+            entry_top = round(max(p["price"] for p in zone_pivots[-3:]), 5)
+        else:
+            entry_bottom = round(zone_level * 0.998, 5)
+            entry_top = round(zone_level * 1.002, 5)
+        risk = entry_bottom - sl
+        valid_tp = [z for z in find_supply_zones(df_1h) if z["bottom"] > current_price]
+        tp = round(valid_tp[0]["bottom"], 5) if valid_tp else round(entry_bottom + abs(risk) * 3, 5)
+        rr = round(abs(tp - entry_bottom) / abs(risk), 2) if risk != 0 else 0.0
+        pos = "bottom" if current_price < zone_level * 1.005 else "upper" if current_price > zone_level * 1.015 else "mid"
+        vwap_aligned = current_price > vwap_level
+        tl_key = "support_trendline"
+    else:
+        zone_pivots = [p for p in _pivot_highs(df_1h, left=2, right=2)
+                       if abs(p["price"] - zone_level) / zone_level < 0.025]
+        sl = round(df_1h["high"].tail(50).max() * 1.0005, 5)
+        if zone_pivots:
+            entry_top = round(max(p["price"] for p in zone_pivots[-3:]), 5)
+            entry_bottom = round(min(p["price"] for p in zone_pivots[-3:]), 5)
+        else:
+            entry_top = round(zone_level * 1.002, 5)
+            entry_bottom = round(zone_level * 0.998, 5)
+        entry_bottom, entry_top = min(entry_bottom, entry_top), max(entry_bottom, entry_top)
+        risk = sl - entry_top
+        valid_tp = [z for z in find_demand_zones(df_1h) if z["top"] < current_price]
+        tp = round(valid_tp[-1]["top"], 5) if valid_tp else round(entry_top - abs(risk) * 3, 5)
+        rr = round(abs(tp - entry_top) / abs(risk), 2) if risk != 0 else 0.0
+        pos = "top" if current_price > zone_level * 0.995 else "lower" if current_price < zone_level * 0.985 else "mid"
+        vwap_aligned = current_price < vwap_level
+        tl_key = "resistance_trendline"
+
+    return {
+        "entry_zone": f"{entry_bottom} — {entry_top}",
+        "sl": sl, "tp": tp, "rr": rr,
+        "position_in_zone": pos,
+        "current_price": round(current_price, 5),
+        "vwap_1h": vwap_level,
+        "price_above_vwap": current_price > vwap_level,
+        "vwap_aligned": vwap_aligned,
+        "trendlines": trendlines,
+        "trendline_near": bool(trendlines.get(tl_key, {}).get("price_near_line")),
+    }
+
+
+def run_kj_confluence_check(symbol: str, client) -> dict:
+    """
+    Universal top-down KJ confluence check — any symbol, LONG or SHORT.
+    Key level = nearest unmitigated daily demand (LONG) or supply (SHORT) zone.
+    Returns the higher-scoring direction with 10-point checklist.
+    """
+    df_daily_full = client.get_candles(symbol, "1D", bars=500)
+    df_monthly = _resample_daily_to(df_daily_full, "monthly")
+    df_weekly = _resample_daily_to(df_daily_full, "weekly")
+    df_daily = df_daily_full.tail(60).reset_index(drop=True)
+    df_4h = client.get_candles(symbol, "4H", bars=120)
+    df_1h = client.get_candles(symbol, "1H", bars=200)
+
+    best_result = None
+    best_score = -1
+
+    for direction in ("LONG", "SHORT"):
+        key = _find_key_level(df_daily_full, direction)
+        zone_level = key["zone_level"]
+
+        weekly = _check_weekly_intent(df_weekly, zone_level, direction)
+        daily = _check_daily_validation_generic(df_daily, zone_level, direction)
+        reversal = _check_4h_reversal_generic(df_4h, zone_level, direction)
+        entry = _get_1h_entry_generic(df_1h, zone_level, reversal, direction)
+
+        checklist = {
+            "key_level_identified": key["found"],
+            "weekly_wick_rejections": weekly["rejection_wicks"] >= 2,
+            "weekly_directional_closes": weekly["directional_closes"] >= 1,
+            "daily_rejection_closes": daily["rejection_closes"] >= 3,
+            "daily_candle_size_decreasing": daily["candle_size_decreasing"],
+            "daily_consolidation": daily["consolidating"],
+            "4h_reversal_pattern": reversal["found"],
+            "1h_entry_in_zone": entry["position_in_zone"] in ("bottom", "mid", "top"),
+            "vwap_aligned": entry["vwap_aligned"],
+            "trendline_confluence": entry["trendline_near"],
+        }
+        score = sum(checklist.values())
+
+        if score > best_score:
+            best_score = score
+            best_result = {
+                "symbol": symbol,
+                "direction": direction,
+                "confluence_score": f"{score}/10",
+                "raw_score": score,
+                "setup_valid": score >= 5,
+                "checklist": checklist,
+                "key_level": key,
+                "weekly": weekly,
+                "daily": daily,
+                "4h_reversal": reversal,
+                "1h_entry": entry,
+                "message": (
+                    f"SETUP CONFIRMED — {score}/10. {reversal.get('entry_signal', '')}"
+                    if score >= 5
+                    else f"Not ready — {score}/10 confluences (need 5+)."
+                ),
+            }
+
+    return best_result or {
+        "symbol": symbol, "direction": "LONG",
+        "confluence_score": "0/10", "raw_score": 0, "setup_valid": False,
+        "message": "Could not identify key levels.",
     }
