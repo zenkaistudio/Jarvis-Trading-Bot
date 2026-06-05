@@ -306,7 +306,7 @@ def _valid_tp(opposing: list, direction: str, current_price: float, entry: float
         return valid[-1]["top"] if valid else round(entry - abs(sl - entry) * 4, 5)
 
 
-def _build_setups(df_1h, fvgs, vwap_data, trendlines, direction, zones, opposing, trade_type="TREND", current_price=None):
+def _build_setups(df_entry, fvgs, vwap_data, trendlines, direction, zones, opposing, trade_type="TREND", current_price=None):
     """
     Shared setup builder for both trend and scalp directions.
     trade_type: 'TREND' (with structure) or 'SCALP' (counter-trend, stricter R:R)
@@ -330,7 +330,7 @@ def _build_setups(df_1h, fvgs, vwap_data, trendlines, direction, zones, opposing
             if direction == "SHORT" and zone["bottom"] <= current_price:
                 continue  # supply zone below current price — price already past it
 
-        sweep = check_liquidity_sweep(df_1h, zone)
+        sweep = check_liquidity_sweep(df_entry, zone)
         if not sweep["occurred"]:
             continue
 
@@ -395,24 +395,117 @@ def _build_setups(df_1h, fvgs, vwap_data, trendlines, direction, zones, opposing
     return setups
 
 
-def run_smc_scan(symbol: str, client) -> dict:
+def run_range_scan(symbol: str, client, entry_tf: str = "15m") -> dict:
     """
-    Full SMC scan — detects both TREND and SCALP setups:
-    - TREND: trades with 4H structure (LONG in bullish, SHORT in bearish), R:R ≥ 3:1
-    - SCALP: counter-trend from opposing zones (short from supply in bullish market,
-             long from demand in bearish market), R:R ≥ 2:1, flagged as higher risk
+    Range scan: when price is bound between support and resistance, trade the extremes.
+    LONG from demand zones in the lower 40% of the range.
+    SHORT from supply zones in the upper 40% of the range.
+    R:R ≥ 2:1. No structural confirmation required.
+    entry_tf: timeframe for sweep detection (5m, 15m, 30m, 1H).
     """
     df_4h = client.get_candles(symbol, "4H", bars=120)
     structure = get_market_structure(df_4h)
 
     df_1h = client.get_candles(symbol, "1H", bars=250)
-    fvgs = find_fvg(df_1h)
     vwap_data = get_vwap_bias(df_1h)
-    trendlines = get_trendlines(df_1h)
-
     demand_zones = find_demand_zones(df_1h)
     supply_zones = find_supply_zones(df_1h)
     current_price = df_1h["close"].iloc[-1]
+
+    _tf_bars = {"5m": 300, "15m": 200, "30m": 150, "1H": 200}
+    df_entry = client.get_candles(symbol, entry_tf, bars=_tf_bars.get(entry_tf, 400))
+
+    recent = df_1h.tail(100)
+    range_high = round(recent["high"].max(), 5)
+    range_low = round(recent["low"].min(), 5)
+    range_size = range_high - range_low
+
+    setups = []
+
+    for zone in demand_zones:
+        if zone["top"] > range_low + range_size * 0.4:
+            continue
+        if current_price <= zone["top"]:
+            continue
+        entry = zone["top"]
+        sl = round(zone["bottom"] * 0.9997, 5)
+        valid_supplies = [z for z in supply_zones if z["bottom"] > entry]
+        tp = valid_supplies[0]["bottom"] if valid_supplies else round(range_high * 0.998, 5)
+        rr = calculate_rr(entry, sl, tp)
+        if rr < 2.0:
+            continue
+        sweep = check_liquidity_sweep(df_entry, zone)
+        setups.append({
+            "direction": "LONG",
+            "trade_type": "RANGE",
+            "entry": round(entry, 5),
+            "sl": round(sl, 5),
+            "tp": round(tp, 5),
+            "rr": rr,
+            "sweep_confirmed": sweep["occurred"],
+            "zone": zone,
+        })
+
+    for zone in supply_zones:
+        if zone["bottom"] < range_high - range_size * 0.4:
+            continue
+        if current_price >= zone["bottom"]:
+            continue
+        entry = zone["bottom"]
+        sl = round(zone["top"] * 1.0003, 5)
+        valid_demands = [z for z in demand_zones if z["top"] < entry]
+        tp = valid_demands[-1]["top"] if valid_demands else round(range_low * 1.002, 5)
+        rr = calculate_rr(entry, sl, tp)
+        if rr < 2.0:
+            continue
+        sweep = check_liquidity_sweep(df_entry, zone)
+        setups.append({
+            "direction": "SHORT",
+            "trade_type": "RANGE",
+            "entry": round(entry, 5),
+            "sl": round(sl, 5),
+            "tp": round(tp, 5),
+            "rr": rr,
+            "sweep_confirmed": sweep["occurred"],
+            "zone": zone,
+        })
+
+    msg = f"{len(setups)} range setup(s) found." if setups else "No valid range setups — zones too close or R:R insufficient."
+    return {
+        "symbol": symbol,
+        "structure": structure,
+        "entry_tf": entry_tf,
+        "range_high": range_high,
+        "range_low": range_low,
+        "vwap": vwap_data,
+        "valid_setups": setups,
+        "setup_count": len(setups),
+        "message": msg,
+    }
+
+
+def run_smc_scan(symbol: str, client, entry_tf: str = "15m") -> dict:
+    """
+    Full SMC scan — detects both TREND and SCALP setups:
+    - TREND: trades with 4H structure (LONG in bullish, SHORT in bearish), R:R ≥ 3:1
+    - SCALP: counter-trend from opposing zones, R:R ≥ 2:1, flagged as higher risk
+    entry_tf: timeframe for FVG + liquidity sweep detection (5m, 15m, 30m, 1H)
+    Zones and structure are always identified on 1H/4H for stability.
+    """
+    df_4h = client.get_candles(symbol, "4H", bars=120)
+    structure = get_market_structure(df_4h)
+
+    df_1h = client.get_candles(symbol, "1H", bars=250)
+    vwap_data = get_vwap_bias(df_1h)
+    trendlines = get_trendlines(df_1h)
+    demand_zones = find_demand_zones(df_1h)
+    supply_zones = find_supply_zones(df_1h)
+    current_price = df_1h["close"].iloc[-1]
+
+    # Entry TF: FVG and sweep on the user's preferred precision timeframe
+    _tf_bars = {"5m": 300, "15m": 200, "30m": 150, "1H": 200}
+    df_entry = client.get_candles(symbol, entry_tf, bars=_tf_bars.get(entry_tf, 400))
+    fvgs = find_fvg(df_entry)
 
     valid_setups = []
 
@@ -420,22 +513,26 @@ def run_smc_scan(symbol: str, client) -> dict:
         return {
             "symbol": symbol,
             "structure": "ranging",
+            "entry_tf": entry_tf,
             "vwap": vwap_data,
             "trendlines": trendlines,
+            "demand_zones": demand_zones,
+            "supply_zones": supply_zones,
+            "current_price": current_price,
             "valid_setups": [],
-            "message": "No trade — market structure is ranging.",
+            "message": "No trade — market structure is ranging. Try `range` command.",
         }
 
     if structure == "bullish":
-        valid_setups += _build_setups(df_1h, fvgs, vwap_data, trendlines,
+        valid_setups += _build_setups(df_entry, fvgs, vwap_data, trendlines,
                                        "LONG", demand_zones, supply_zones, "TREND", current_price)
-        valid_setups += _build_setups(df_1h, fvgs, vwap_data, trendlines,
+        valid_setups += _build_setups(df_entry, fvgs, vwap_data, trendlines,
                                        "SHORT", supply_zones, demand_zones, "SCALP", current_price)
 
     elif structure == "bearish":
-        valid_setups += _build_setups(df_1h, fvgs, vwap_data, trendlines,
+        valid_setups += _build_setups(df_entry, fvgs, vwap_data, trendlines,
                                        "SHORT", supply_zones, demand_zones, "TREND", current_price)
-        valid_setups += _build_setups(df_1h, fvgs, vwap_data, trendlines,
+        valid_setups += _build_setups(df_entry, fvgs, vwap_data, trendlines,
                                        "LONG", demand_zones, supply_zones, "SCALP", current_price)
 
     trend_count = sum(1 for s in valid_setups if s["trade_type"] == "TREND")
@@ -453,9 +550,13 @@ def run_smc_scan(symbol: str, client) -> dict:
     return {
         "symbol": symbol,
         "structure": structure,
+        "entry_tf": entry_tf,
         "direction_bias": trend_bias,
         "vwap": vwap_data,
         "trendlines": trendlines,
+        "demand_zones": demand_zones,
+        "supply_zones": supply_zones,
+        "current_price": current_price,
         "valid_setups": valid_setups,
         "setup_count": len(valid_setups),
         "message": message,

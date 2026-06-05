@@ -51,13 +51,12 @@ HELP_TEXT = """
 `bias GBPJPY` — quick directional bias (structure + VWAP)
 
 *Analysis*
-`scan GBPJPY` — SMC + KJ scan for any pair + auto-watch levels
-`kj GBPJPY` — full top-down KJ confluence check (any pair)
-`scalp GBPJPY` — counter-trend scalp setups only (R:R ≥ 2:1)
+`scan GBPJPY` — SMC scan any pair + auto-watch levels
+`gbpjpy` or `kj` — full KJ top-down confluence (GBPJPY only)
+`scalp EURUSD` — scalp levels, quality rating + nearest zones for any pair
 `range GBPJPY` — range-bound setups: buy support, sell resistance
 `scan all` — scan entire watchlist (SMC)
-`rate all` — KJ confluence rating for every pair at once
-`gbpjpy` — original KJ check (GBPJPY specific)
+`rate all` — SMC star rating for all pairs (KJ shown for GBPJPY)
 `rescan` — force immediate rescan right now
 
 *Watchlist*
@@ -213,46 +212,22 @@ class JarvisMonitor:
                 print(f"[Jarvis] Error scanning {symbol}: {e}")
 
     def _scan_kj_all(self):
-        """Run KJ confluence check on all watchlist pairs. Alert when score ≥ threshold."""
+        """KJ scan — GBPJPY only. Alerts when score meets threshold."""
         config = self._load_config()
         threshold = config.get("gbpjpy_alert_threshold", 5)
-        for symbol in config.get("watchlist", WATCHLIST):
-            try:
-                if symbol == "GBPJPY":
-                    # Use original GBPJPY-specific strategy for this pair
-                    result = run_gbpjpy_confluence_check(self.client)
-                    score = int(result.get("confluence_score", "0/10").split("/")[0])
-                    if score >= threshold and score > self._alerted_gbpjpy_score:
-                        self._alerted_gbpjpy_score = score
-                        self._notify(format_gbpjpy_alert(result))
-                        watched = setup_from_gbpjpy(result)
-                        if watched:
-                            self.watcher.add(watched)
-                    elif score < threshold:
-                        self._alerted_gbpjpy_score = 0
-                else:
-                    result = run_kj_confluence_check(symbol, self.client)
-                    score = result.get("raw_score", 0)
-                    direction = result.get("direction", "?")
-                    if result.get("setup_valid") and score >= threshold:
-                        entry = result.get("1h_entry", {})
-                        reversal = result.get("4h_reversal", {})
-                        msg = (
-                            f"🎯 *{symbol} KJ Setup — {score}/10*\n\n"
-                            f"Direction: *{direction}*\n"
-                            f"Pattern: `{reversal.get('pattern', 'None')}`\n"
-                            f"Entry: `{entry.get('entry_zone', 'N/A')}`\n"
-                            f"SL: `{entry.get('sl', 'N/A')}`\n"
-                            f"TP: `{entry.get('tp', 'N/A')}`\n"
-                            f"R:R: `{entry.get('rr', 'N/A')}:1`\n\n"
-                            f"_{result.get('message', '')}_"
-                        )
-                        self._notify(msg)
-                        watched = setup_from_kj(result)
-                        if watched:
-                            self.watcher.add(watched)
-            except Exception as e:
-                print(f"[Jarvis] KJ scan error {symbol}: {e}")
+        try:
+            result = run_gbpjpy_confluence_check(self.client)
+            score = int(result.get("confluence_score", "0/10").split("/")[0])
+            if score >= threshold and score > self._alerted_gbpjpy_score:
+                self._alerted_gbpjpy_score = score
+                self._notify(format_gbpjpy_alert(result))
+                watched = setup_from_gbpjpy(result)
+                if watched:
+                    self.watcher.add(watched)
+            elif score < threshold:
+                self._alerted_gbpjpy_score = 0
+        except Exception as e:
+            print(f"[Jarvis] KJ scan error: {e}")
 
     # ── Telegram Chat Loop ────────────────────────────────────────────────────
 
@@ -404,9 +379,14 @@ class JarvisMonitor:
             if text.startswith("kj") or text.startswith("confluence "):
                 symbol = _parse_symbol(text)
                 if not symbol:
-                    return "❓ Usage: `kj GBPJPY` or `kj gold`"
-                self._notify(f"🔍 Running KJ confluence check: {symbol}...")
-                return self._do_kj_check(symbol)
+                    return "❓ Usage: `kj GBPJPY`"
+                if symbol != "GBPJPY":
+                    return (
+                        f"⚠️ KJ is GBPJPY-specific — won't be accurate on {symbol}.\n"
+                        f"Use `scan {symbol}` for SMC or `scalp {symbol}` for scalp levels."
+                    )
+                self._notify("🔍 Running KJ confluence check: GBPJPY...")
+                return self._do_kj_check("GBPJPY")
 
             if any(text.startswith(w) for w in ("rate", "ratings", "rating")):
                 threading.Thread(target=self._bg_ratings_all, daemon=True).start()
@@ -619,24 +599,25 @@ class JarvisMonitor:
         entry_tf = self._load_config().get("entry_timeframe", "15m")
         result = run_smc_scan(symbol, self.client, entry_tf=entry_tf)
 
-        # Run KJ check in parallel for combined rating
+        # KJ is GBPJPY-specific only
         kj_line = ""
-        try:
-            kj = run_kj_confluence_check(symbol, self.client)
-            kj_score = kj.get("raw_score", 0)
-            kj_dir = kj.get("direction", "?")
-            kj_valid = kj.get("setup_valid", False)
-            kj_line = (
-                f"\n\n📐 *KJ Score: `{kj.get('confluence_score', '?/10')}`* — {kj_dir} "
-                f"{'✅' if kj_valid else '⏳'}"
-                f"\n_Type `kj {symbol}` for full top-down breakdown._"
-            )
-            if kj_valid:
-                watched_kj = setup_from_kj(kj)
-                if watched_kj:
-                    self.watcher.add(watched_kj)
-        except Exception:
-            pass
+        if symbol == "GBPJPY":
+            try:
+                kj = run_gbpjpy_confluence_check(self.client)
+                kj_score = int(kj.get("confluence_score", "0/10").split("/")[0])
+                kj_dir = kj.get("direction", "?")
+                kj_valid = kj_score >= 5
+                kj_line = (
+                    f"\n\n📐 *KJ Score: `{kj.get('confluence_score', '?/10')}`* — {kj_dir} "
+                    f"{'✅' if kj_valid else '⏳'}"
+                    f"\n_Type `kj` for full top-down breakdown._"
+                )
+                if kj_valid:
+                    watched_kj = setup_from_gbpjpy(kj)
+                    if watched_kj:
+                        self.watcher.add(watched_kj)
+            except Exception:
+                pass
 
         if not result.get("valid_setups"):
             return (
@@ -702,7 +683,7 @@ class JarvisMonitor:
         return reply
 
     def _bg_ratings_all(self):
-        """Run KJ confluence on all pairs and send a combined rating table."""
+        """Rate all pairs: GBPJPY uses KJ score, all others use SMC score."""
         config = self._load_config()
         watchlist = config.get("watchlist", WATCHLIST)
         entry_tf = config.get("entry_timeframe", "15m")
@@ -711,72 +692,131 @@ class JarvisMonitor:
         best_sym = ""
         best_dir = ""
 
-        def _stars(combined: int) -> str:
-            if combined >= 12: return "⭐⭐⭐⭐⭐"
-            if combined >= 9:  return "⭐⭐⭐⭐"
-            if combined >= 6:  return "⭐⭐⭐"
-            if combined >= 3:  return "⭐⭐"
+        def _stars(n: int, out_of: int) -> str:
+            pct = n / out_of if out_of else 0
+            if pct >= 0.85: return "⭐⭐⭐⭐⭐"
+            if pct >= 0.65: return "⭐⭐⭐⭐"
+            if pct >= 0.45: return "⭐⭐⭐"
+            if pct >= 0.25: return "⭐⭐"
             return "⭐"
 
         for symbol in watchlist:
             try:
-                kj = run_kj_confluence_check(symbol, self.client)
                 smc = run_smc_scan(symbol, self.client, entry_tf=entry_tf)
-                kj_raw = kj.get("raw_score", 0)
-                smc_raw = max((s.get("confluence_score", "0/5").split("/")[0] for s in smc.get("valid_setups", [{"confluence_score": "0/5"}])), default="0")
+                smc_raw = max(
+                    (s.get("confluence_score", "0/5").split("/")[0]
+                     for s in smc.get("valid_setups", [{"confluence_score": "0/5"}])),
+                    default="0"
+                )
                 try:
                     smc_int = int(smc_raw)
                 except Exception:
                     smc_int = 0
-                combined = kj_raw + smc_int
-                direction = kj.get("direction", "?")
-                valid_tag = "✅" if kj.get("setup_valid") else "·"
-                rows.append(
-                    f"{valid_tag} `{symbol:<7}` {_stars(combined)}  KJ `{kj.get('confluence_score')}` SMC `{smc_int}/5` — {direction}"
-                )
-                if combined > best_score:
-                    best_score = combined
+                direction = smc.get("direction_bias", "?").upper()
+
+                if symbol == "GBPJPY":
+                    kj = run_gbpjpy_confluence_check(self.client)
+                    kj_raw = int(kj.get("confluence_score", "0/10").split("/")[0])
+                    kj_valid = kj_raw >= 5
+                    direction = kj.get("direction", direction)
+                    score = kj_raw
+                    valid_tag = "✅" if kj_valid else "·"
+                    rows.append(
+                        f"{valid_tag} `{symbol:<7}` {_stars(kj_raw, 10)}  KJ `{kj_raw}/10` SMC `{smc_int}/5` — {direction}"
+                    )
+                else:
+                    valid_tag = "✅" if smc.get("valid_setups") else "·"
+                    score = smc_int
+                    rows.append(
+                        f"{valid_tag} `{symbol:<7}` {_stars(smc_int, 5)}  SMC `{smc_int}/5` — {direction}"
+                    )
+
+                if score > best_score:
+                    best_score = score
                     best_sym = symbol
                     best_dir = direction
             except Exception as e:
                 rows.append(f"· `{symbol}` — error: {e}")
 
         table = "\n".join(rows)
-        footer = f"\n\n🥇 *Best:* `{best_sym}` {best_dir} (combined {best_score}/15)" if best_score >= 0 else ""
+        footer = f"\n\n🥇 *Best:* `{best_sym}` {best_dir}" if best_sym else ""
         self._notify(
-            f"📊 *Pair Ratings — KJ + SMC*\n\n{table}{footer}\n\n"
-            f"_Type `kj SYMBOL` for full breakdown. Type `scan SYMBOL` for SMC levels._"
+            f"📊 *Pair Ratings*\n\n{table}{footer}\n\n"
+            f"_`scan SYMBOL` for SMC levels · `kj` for GBPJPY KJ · `scalp SYMBOL` for scalp levels_"
         )
 
     def _do_scalp_scan(self, symbol: str) -> str:
         entry_tf = self._load_config().get("entry_timeframe", "15m")
         result = run_smc_scan(symbol, self.client, entry_tf=entry_tf)
+        structure = result.get("structure", "ranging")
+        vwap_bias = result.get("vwap", {}).get("bias", "neutral")
+        demand_zones = result.get("demand_zones", [])
+        supply_zones = result.get("supply_zones", [])
+        current_price = result.get("current_price")
         scalp_setups = [s for s in result.get("valid_setups", []) if s.get("trade_type") == "SCALP"]
-        if not scalp_setups:
-            return (
-                f"⚡ *{symbol} Scalp Scan*\n\n"
-                f"Structure: `{result.get('structure', 'N/A').upper()}`\n\n"
-                f"No scalp setups right now.\n"
-                f"_Scalp = counter-trend from opposing zone. Needs supply in bullish market or demand in bearish._"
-            )
-        top = scalp_setups[0]
-        try:
-            current_price = self.client.get_tick(symbol)["price"]
-        except Exception:
-            current_price = None
-        watched = setup_from_smc(result, top)
-        self.watcher.add(watched, current_price)
-        return (
-            f"⚡ *{symbol} SCALP Setup*\n\n"
-            f"Direction: *{top['direction']}* (counter-trend)\n"
-            f"Entry: `{top['entry']}`\n"
-            f"Stop Loss: `{top['sl']}`\n"
-            f"Take Profit: `{top['tp']}`\n"
-            f"R:R: `{top['rr']}:1`\n"
-            f"Confluence: `{top.get('confluence_score', 'N/A')}`\n\n"
-            f"_Counter-trend — use smaller size. Higher risk._\n"
-            f"👁 _Jarvis is watching these levels._"
-        )
+
+        # Find nearest zones to current price
+        def _nearest(zones):
+            if not zones or not current_price:
+                return None
+            return min(zones, key=lambda z: abs(((z["top"] + z["bottom"]) / 2) - current_price))
+
+        near_demand = _nearest(demand_zones)
+        near_supply = _nearest(supply_zones)
+
+        # Scalp quality rating 1–5
+        rating = 1
+        scalp_dir = "—"
+        if scalp_setups:
+            rating = 5
+            scalp_dir = scalp_setups[0]["direction"]
+        else:
+            if structure in ("bullish", "bearish"):
+                rating += 1
+            if current_price and near_demand:
+                demand_mid = (near_demand["top"] + near_demand["bottom"]) / 2
+                dist_pct = abs(current_price - demand_mid) / current_price * 100
+                if dist_pct < 0.15:
+                    rating += 2; scalp_dir = "LONG"
+                elif dist_pct < 0.4:
+                    rating += 1; scalp_dir = "LONG"
+            if current_price and near_supply:
+                supply_mid = (near_supply["top"] + near_supply["bottom"]) / 2
+                dist_pct = abs(current_price - supply_mid) / current_price * 100
+                if dist_pct < 0.15:
+                    rating += 2; scalp_dir = "SHORT"
+                elif dist_pct < 0.4:
+                    rating += 1; scalp_dir = "SHORT"
+            rating = min(rating, 4)
+
+        stars = "⭐" * rating
+        lines = [f"⚡ *{symbol} Scalp Analysis*\n"]
+        lines.append(f"Structure: `{structure.upper()}` | VWAP: `{vwap_bias}`")
+        lines.append(f"Scalp Quality: {stars} ({rating}/5) | Direction: *{scalp_dir}*\n")
+
+        if near_demand:
+            lines.append(f"📗 Nearest Demand Zone: `{near_demand['bottom']} – {near_demand['top']}`")
+        if near_supply:
+            lines.append(f"📕 Nearest Supply Zone: `{near_supply['bottom']} – {near_supply['top']}`")
+        if current_price:
+            lines.append(f"💱 Current Price: `{current_price}`")
+
+        if scalp_setups:
+            top = scalp_setups[0]
+            lines.append(f"\n✅ *Active Scalp Setup Found:*")
+            lines.append(f"Entry: `{top['entry']}` | SL: `{top['sl']}` | TP: `{top['tp']}` | R:R: `{top['rr']}:1`")
+            try:
+                tick_price = self.client.get_tick(symbol)["price"]
+            except Exception:
+                tick_price = current_price
+            watched = setup_from_smc(result, top)
+            self.watcher.add(watched, tick_price)
+            lines.append("\n👁 _Jarvis is watching these levels._")
+        else:
+            lines.append(f"\n⏳ No confirmed scalp setup — wait for price to reach zone, then look for a 5m flip.")
+
+        lines.append(f"\n_Scalp = counter-trend. Smaller size, quick exit._")
+        return "\n".join(lines)
 
     def _do_range_scan(self, symbol: str) -> str:
         entry_tf = self._load_config().get("entry_timeframe", "15m")
