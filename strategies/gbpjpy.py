@@ -8,7 +8,9 @@ Minimum 5/10 confluences required before flagging a setup.
 import numpy as np
 import pandas as pd
 
-from .smc import _pivot_highs, _pivot_lows, calculate_vwap, get_trendlines, find_supply_zones, find_demand_zones
+from .smc import (_pivot_highs, _pivot_lows, calculate_vwap, get_trendlines,
+                   find_supply_zones, find_demand_zones, get_corridor,
+                   analyze_quarter_pa, detect_blown_quarter)
 
 
 SYMBOL = "GBPJPY"
@@ -255,6 +257,39 @@ def get_1h_entry(df_1h: pd.DataFrame, zone_level: float, pattern_info: dict) -> 
     }
 
 
+# ── Quarter Level Theory (GBPJPY-specific) ───────────────────────────────────
+
+def _nearest_quarter_level(price: float) -> float:
+    """Return the nearest .00/.25/.50/.75 quarter level to the given price."""
+    big = int(price)
+    candidates = [big + q for q in (0.0, 0.25, 0.50, 0.75, 1.00)]
+    return min(candidates, key=lambda q: abs(price - q))
+
+
+def check_quarter_level_confluence(zone_level: float, tp_level: float) -> dict:
+    """
+    GBPJPY quarter theory: institutional orders cluster at .00/.25/.50/.75 levels.
+    Zone check: key level within 10 pips (0.10) of a quarter level.
+    TP check: take profit within 15 pips (0.15) of the next quarter level up.
+    """
+    zone_q = _nearest_quarter_level(zone_level)
+    zone_dist = abs(zone_level - zone_q)
+    zone_at_quarter = zone_dist <= 0.10
+
+    tp_q = _nearest_quarter_level(tp_level)
+    tp_dist = abs(tp_level - tp_q)
+    tp_at_quarter = tp_dist <= 0.15
+
+    return {
+        "zone_at_quarter": zone_at_quarter,
+        "nearest_zone_quarter": round(zone_q, 2),
+        "zone_distance_pips": round(zone_dist * 100, 1),
+        "tp_at_quarter": tp_at_quarter,
+        "nearest_tp_quarter": round(tp_q, 2),
+        "tp_distance_pips": round(tp_dist * 100, 1),
+    }
+
+
 # ── Full GBPJPY Confluence Check ─────────────────────────────────────────────
 
 def _resample_daily_to(df_daily: pd.DataFrame, freq: str) -> pd.DataFrame:
@@ -299,7 +334,34 @@ def run_gbpjpy_confluence_check(client) -> dict:
     # Step 5: 1H entry
     entry = get_1h_entry(df_1h, zone_level, reversal)
 
-    # Confluence scoring (10 possible points from KJ checklist)
+    # Step 6: Quarter level proximity (still used for TP alignment display)
+    quarter = check_quarter_level_confluence(zone_level, entry["tp"])
+
+    # Step 7: Corridor position
+    current_price = df_1h["close"].iloc[-1]
+    corridor = get_corridor(SYMBOL, current_price)
+
+    # Step 8: Quarter price action — behavioral history at current floor/ceiling
+    qpa_profiles = analyze_quarter_pa(SYMBOL, df_1h, current_price)
+    floor_lvl = corridor["floor"]
+    ceil_lvl = corridor["ceiling"]
+    floor_profile = qpa_profiles.get(floor_lvl, {})
+    ceil_profile = qpa_profiles.get(ceil_lvl, {})
+
+    # Floor is "strong" if it has a history of holding (not just proximity to a .25/.50/.75)
+    floor_reaction = floor_profile.get("reaction", "UNTESTED")
+    quarter_floor_strong = floor_reaction in ("STRONG S/R", "S/R", "TRAP ZONE")
+
+    # Ceiling toward TP is "clear" if price has broken through it before or it's untested
+    # A STRONG S/R ceiling means TP is blocked — not ideal
+    ceil_reaction = ceil_profile.get("reaction", "UNTESTED")
+    quarter_ceiling_clear = ceil_reaction not in ("STRONG S/R", "S/R")
+
+    # Step 9: Blown quarter — aggressive bullish break through a quarter level recently
+    blown_q = detect_blown_quarter(SYMBOL, df_1h)
+    blown_quarter_bullish = blown_q.get("detected", False) and blown_q.get("direction") == "UP"
+
+    # Confluence scoring (14 possible points — KJ checklist + behavioral quarter + corridor)
     checklist = {
         "monthly_rs_flip": monthly["found"],
         "weekly_wick_rejections": weekly["rejection_wicks"] >= 2,
@@ -311,14 +373,18 @@ def run_gbpjpy_confluence_check(client) -> dict:
         "1h_entry_in_zone": entry["position_in_zone"] in ("bottom", "mid"),
         "vwap_aligned": entry["price_above_vwap"],
         "trendline_confluence": bool(entry["trendlines"].get("support_trendline", {}).get("price_near_line")),
+        "quarter_floor_strong": quarter_floor_strong,       # floor has behavioral history of holding
+        "quarter_ceiling_clear": quarter_ceiling_clear,     # TP path not blocked by a proven wall
+        "corridor_entry_bottom": corridor["zone"] in ("base", "lower"),
+        "blown_quarter_momentum": blown_quarter_bullish,    # recent aggressive bullish break confirms intent
     }
 
     score = sum(checklist.values())
-    setup_valid = score >= 5
+    setup_valid = score >= 8
 
     return {
         "symbol": SYMBOL,
-        "confluence_score": f"{score}/10",
+        "confluence_score": f"{score}/14",
         "setup_valid": setup_valid,
         "checklist": checklist,
         "monthly": monthly,
@@ -326,10 +392,14 @@ def run_gbpjpy_confluence_check(client) -> dict:
         "daily": daily,
         "4h_reversal": reversal,
         "1h_entry": entry,
+        "quarter": quarter,
+        "corridor": corridor,
+        "qpa_profiles": qpa_profiles,
+        "blown_quarter": blown_q,
         "message": (
-            f"SETUP CONFIRMED — {score}/10 confluences. {reversal.get('entry_signal', '')}"
+            f"SETUP CONFIRMED — {score}/14 confluences. {reversal.get('entry_signal', '')}"
             if setup_valid
-            else f"Not ready — only {score}/10 confluences (need 5+). Keep monitoring."
+            else f"Not ready — only {score}/14 confluences (need 8+). Keep monitoring."
         ),
     }
 

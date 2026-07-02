@@ -3,8 +3,302 @@ SMC Strategy — based on SMC_Strategy_Playbook.md
 Logic: 4H structure → 1H zones → FVG → liquidity sweep → VWAP + trendline confluence → R:R ≥ 3:1
 """
 
+import math
+
 import numpy as np
 import pandas as pd
+
+
+# ── Corridor Levels ───────────────────────────────────────────────────────────
+# Quarter-interval spacing per instrument. These define the "box" price moves
+# between: the floor, ceiling, and midpoint of each institutional corridor.
+
+CORRIDOR_INTERVALS = {
+    "GBPJPY": 0.25,    # JPY pairs — 25 pip corridors
+    "NZDJPY": 0.25,
+    "EURUSD": 0.0025,  # 4-decimal pairs — 25 pip corridors
+    "AUDCAD": 0.0025,
+    "XAUUSD": 25.0,    # Gold — $25 corridors
+    "NAS100": 100.0,   # Nasdaq — 100-point corridors
+}
+
+
+def get_corridor(symbol: str, price: float) -> dict:
+    """
+    Identify the current quarter-level corridor for any symbol.
+    Returns the floor/ceiling of the box price is in, position within it,
+    and a zone label: base / lower / mid / upper / top.
+    """
+    interval = CORRIDOR_INTERVALS.get(symbol.upper(), 0.0025)
+    lower = round(math.floor(price / interval) * interval, 5)
+    upper = round(lower + interval, 5)
+    midpoint = round(lower + interval / 2, 5)
+    position_pct = round((price - lower) / interval * 100, 1)
+
+    if position_pct <= 20:
+        zone = "base"       # sitting on the floor — strongest support
+    elif position_pct <= 40:
+        zone = "lower"      # lower third — good entry for longs
+    elif position_pct <= 60:
+        zone = "mid"        # middle of corridor — less directional edge
+    elif position_pct <= 80:
+        zone = "upper"      # upper third — approaching ceiling resistance
+    else:
+        zone = "top"        # near ceiling — overextended / short entry
+
+    return {
+        "floor": lower,
+        "ceiling": upper,
+        "midpoint": midpoint,
+        "interval": interval,
+        "position_pct": position_pct,
+        "zone": zone,
+    }
+
+
+def detect_blown_quarter(symbol: str, df: pd.DataFrame, lookback_bars: int = 30) -> dict:
+    """
+    Detects if price recently made an aggressive momentum break through a quarter level.
+    "Blown quarter" = large-body candle (≥1.5× avg) whose close crossed a quarter level cleanly.
+    This flags either bullish continuation (direction=UP) or bearish breakdown (direction=DOWN).
+    Returns the most recent blow within lookback_bars.
+    """
+    interval = CORRIDOR_INTERVALS.get(symbol.upper(), 0.0025)
+    threshold = interval * 0.10
+
+    recent = df.tail(lookback_bars).reset_index(drop=True)
+    avg_body = (recent["close"] - recent["open"]).abs().mean()
+    if avg_body == 0:
+        return {"detected": False}
+
+    # All quarter levels touched in this window
+    price_min = recent["low"].min()
+    price_max = recent["high"].max()
+    first_q = round(math.floor(price_min / interval) * interval, 5)
+    q_levels = []
+    lvl = first_q
+    while lvl <= round(price_max + interval, 5):
+        q_levels.append(round(lvl, 5))
+        lvl = round(lvl + interval, 5)
+
+    blows = []
+    for i in range(1, len(recent)):
+        candle = recent.iloc[i]
+        prev = recent.iloc[i - 1]
+        body = abs(candle["close"] - candle["open"])
+        if body < avg_body * 1.5:
+            continue
+        for q in q_levels:
+            if prev["close"] < q - threshold and candle["close"] > q + threshold:
+                blows.append({"direction": "UP", "level": q, "bar": i,
+                               "close": round(candle["close"], 5)})
+            elif prev["close"] > q + threshold and candle["close"] < q - threshold:
+                blows.append({"direction": "DOWN", "level": q, "bar": i,
+                               "close": round(candle["close"], 5)})
+
+    if not blows:
+        return {"detected": False}
+
+    latest = blows[-1]
+    return {
+        "detected": True,
+        "direction": latest["direction"],
+        "broken_level": latest["level"],
+        "close_after": latest["close"],
+        "bars_ago": len(recent) - 1 - latest["bar"],
+    }
+
+
+def analyze_quarter_pa(symbol: str, df: pd.DataFrame, current_price: float, lookback: int = 300) -> dict:
+    """
+    Scans recent candles and classifies what price ACTUALLY DID at each quarter level.
+    For every level touched: counts rejections, clean breaks, and false breaks (traps).
+    Returns a profile dict keyed by quarter level price.
+    """
+    interval = CORRIDOR_INTERVALS.get(symbol.upper(), 0.0025)
+    touch_threshold = interval * 0.12   # within 12% of the interval = "at the level"
+    confirm_bars = 5                     # bars after touch to confirm outcome
+
+    recent = df.tail(lookback).reset_index(drop=True)
+    price_min = recent["low"].min()
+    price_max = recent["high"].max()
+
+    # All quarter levels in the data's price range
+    first_q = round(math.floor(price_min / interval) * interval, 5)
+    q_levels = []
+    lvl = first_q
+    while lvl <= round(price_max + interval, 5):
+        q_levels.append(round(lvl, 5))
+        lvl = round(lvl + interval, 5)
+
+    profiles = {}
+
+    for q in q_levels:
+        events = []
+        last_touch_bar = -10
+
+        for i in range(2, len(recent) - confirm_bars):
+            c = recent.iloc[i]
+            at_level = abs(c["high"] - q) <= touch_threshold or abs(c["low"] - q) <= touch_threshold
+            if not at_level or i - last_touch_bar < 5:
+                continue
+            last_touch_bar = i
+
+            prev_close = recent.iloc[i - 1]["close"]
+            from_above = prev_close > q
+            future_closes = recent.iloc[i + 1: i + 1 + confirm_bars]["close"].tolist()
+
+            if from_above:
+                # Testing level as support from above
+                broke = any(c < q - touch_threshold for c in future_closes)
+                if broke:
+                    broke_idx = next(j for j, c in enumerate(future_closes) if c < q - touch_threshold)
+                    recovered = any(c > q + touch_threshold for c in future_closes[broke_idx + 1:])
+                    outcome = "FALSE_BREAK_DOWN" if recovered else "BREAK_DOWN"
+                else:
+                    outcome = "REJECT_UP"
+            else:
+                # Testing level as resistance from below
+                broke = any(c > q + touch_threshold for c in future_closes)
+                if broke:
+                    broke_idx = next(j for j, c in enumerate(future_closes) if c > q + touch_threshold)
+                    recovered = any(c < q - touch_threshold for c in future_closes[broke_idx + 1:])
+                    outcome = "FALSE_BREAK_UP" if recovered else "BREAK_UP"
+                else:
+                    outcome = "REJECT_DOWN"
+
+            events.append({"bar": i, "from_above": from_above, "outcome": outcome})
+
+        if not events:
+            continue
+
+        rejects = sum(1 for e in events if e["outcome"].startswith("REJECT"))
+        breaks = sum(1 for e in events if e["outcome"] in ("BREAK_UP", "BREAK_DOWN"))
+        false_breaks = sum(1 for e in events if e["outcome"].startswith("FALSE"))
+        total = len(events)
+
+        if rejects >= 2 and breaks == 0:
+            reaction = "STRONG S/R"
+        elif false_breaks >= 1 and breaks == 0:
+            reaction = "TRAP ZONE"
+        elif rejects > breaks:
+            reaction = "S/R"
+        elif breaks > rejects:
+            reaction = "BROKEN"
+        else:
+            reaction = "CONTESTED"
+
+        profiles[q] = {
+            "level": q,
+            "touches": total,
+            "rejects": rejects,
+            "breaks": breaks,
+            "false_breaks": false_breaks,
+            "reject_rate": round(rejects / total * 100) if total else 0,
+            "reaction": reaction,
+        }
+
+    return profiles
+
+
+def diagnose_quarter_path(symbol: str, current_price: float, profiles: dict) -> dict:
+    """
+    Uses quarter level profiles to produce a plain-English read of likely price path.
+    Diagnoses floor/ceiling behavior and forecasts the next probable move.
+    """
+    interval = CORRIDOR_INTERVALS.get(symbol.upper(), 0.0025)
+    corridor = get_corridor(symbol, current_price)
+    floor_lvl = corridor["floor"]
+    ceil_lvl = corridor["ceiling"]
+    pos_zone = corridor["zone"]
+    pos_pct = corridor["position_pct"]
+
+    floor_p = profiles.get(floor_lvl, {})
+    ceil_p = profiles.get(ceil_lvl, {})
+    floor_react = floor_p.get("reaction", "UNTESTED")
+    ceil_react = ceil_p.get("reaction", "UNTESTED")
+
+    def _level_line(p: dict, lvl: float, role: str) -> str:
+        if not p:
+            return f"{role} `{lvl}` — untested (no prior data)"
+        t, r, b, fb = p["touches"], p["rejects"], p["breaks"], p["false_breaks"]
+        tag = {"STRONG S/R": "🔒 HOLDING", "TRAP ZONE": "🪤 TRAPPY",
+               "S/R": "✅ S/R", "BROKEN": "🔓 BROKEN", "CONTESTED": "⚔️ CONTESTED"}.get(p["reaction"], "?")
+        parts = [f"{role} `{lvl}` — {t} touch(es) | rej {r} · brk {b}"]
+        if fb:
+            parts.append(f"· false break {fb}")
+        parts.append(f"→ {tag}")
+        return "  ".join(parts)
+
+    diagnosis = []
+
+    # Position read
+    if pos_zone in ("base", "lower"):
+        diagnosis.append(f"Price is sitting at the floor `{floor_lvl}` ({pos_pct}% into corridor)")
+    elif pos_zone == "mid":
+        diagnosis.append(f"Price is at the midpoint `{corridor['midpoint']}` — corridor is undecided")
+    else:
+        diagnosis.append(f"Price is pressing the ceiling `{ceil_lvl}` ({100 - pos_pct:.0f}% headroom left)")
+
+    # Floor read
+    diagnosis.append(_level_line(floor_p, floor_lvl, "Floor"))
+
+    # Ceiling read
+    diagnosis.append(_level_line(ceil_p, ceil_lvl, "Ceiling"))
+
+    # Trap warning
+    if floor_react == "TRAP ZONE" and pos_zone in ("base", "lower"):
+        diagnosis.append(f"⚠️ Floor has trapped sellers before — expect false break below `{floor_lvl}` then snap back up")
+    if ceil_react == "TRAP ZONE" and pos_zone in ("upper", "top"):
+        diagnosis.append(f"⚠️ Ceiling has trapped buyers before — expect false break above `{ceil_lvl}` then reversal")
+
+    # Forecast
+    forecast = []
+    next_up = round(ceil_lvl + interval, 5)
+    next_down = round(floor_lvl - interval, 5)
+
+    if pos_zone in ("base", "lower"):
+        if floor_react in ("STRONG S/R", "S/R", "TRAP ZONE"):
+            forecast.append(f"▸ Floor holds → run to ceiling `{ceil_lvl}`")
+            if ceil_react == "BROKEN":
+                forecast.append(f"▸ Ceiling broken before → continuation to `{next_up}` likely")
+            elif ceil_react in ("STRONG S/R", "S/R"):
+                forecast.append(f"▸ Ceiling is firm → expect rejection back to `{floor_lvl}`")
+            else:
+                forecast.append(f"▸ Ceiling untested → first-touch reaction is the tell")
+        if floor_react == "BROKEN":
+            forecast.append(f"▸ Floor previously broken — thin support. Break below → `{next_down}`")
+        forecast.append(f"▸ Floor fails → next support `{next_down}`")
+
+    elif pos_zone in ("upper", "top"):
+        if ceil_react in ("STRONG S/R", "S/R", "TRAP ZONE"):
+            forecast.append(f"▸ Ceiling rejects → back to floor `{floor_lvl}`")
+            if floor_react == "BROKEN":
+                forecast.append(f"▸ Floor weak → breakdown below `{floor_lvl}` into `{next_down}`")
+        if ceil_react == "BROKEN":
+            forecast.append(f"▸ Ceiling broken before → bulls pressing for `{next_up}`")
+        forecast.append(f"▸ Ceiling breaks → next target `{next_up}`")
+
+    else:  # mid
+        if floor_react in ("STRONG S/R",) and ceil_react in ("STRONG S/R",):
+            forecast.append(f"▸ Compressed between strong levels — range `{floor_lvl}↔{ceil_lvl}` until one breaks")
+        elif floor_react == "BROKEN":
+            forecast.append(f"▸ Floor weak — bias short toward `{next_down}`")
+        elif ceil_react == "BROKEN":
+            forecast.append(f"▸ Ceiling broken — bias long toward `{next_up}`")
+        else:
+            forecast.append(f"▸ Mid-corridor, mixed levels — wait for price to reach floor or ceiling before acting")
+
+    return {
+        "corridor": corridor,
+        "floor": floor_lvl,
+        "ceiling": ceil_lvl,
+        "floor_profile": floor_p,
+        "ceiling_profile": ceil_p,
+        "diagnosis": diagnosis,
+        "forecast": forecast,
+        "all_profiles": profiles,
+    }
 
 
 # ── Market Structure ──────────────────────────────────────────────────────────
@@ -509,6 +803,8 @@ def run_smc_scan(symbol: str, client, entry_tf: str = "15m") -> dict:
 
     valid_setups = []
 
+    corridor = get_corridor(symbol, current_price)
+
     if structure == "ranging":
         return {
             "symbol": symbol,
@@ -519,6 +815,7 @@ def run_smc_scan(symbol: str, client, entry_tf: str = "15m") -> dict:
             "demand_zones": demand_zones,
             "supply_zones": supply_zones,
             "current_price": current_price,
+            "corridor": corridor,
             "valid_setups": [],
             "message": "No trade — market structure is ranging. Try `range` command.",
         }
@@ -557,6 +854,7 @@ def run_smc_scan(symbol: str, client, entry_tf: str = "15m") -> dict:
         "demand_zones": demand_zones,
         "supply_zones": supply_zones,
         "current_price": current_price,
+        "corridor": corridor,
         "valid_setups": valid_setups,
         "setup_count": len(valid_setups),
         "message": message,

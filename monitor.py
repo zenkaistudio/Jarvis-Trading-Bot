@@ -6,7 +6,8 @@ from pathlib import Path
 import requests
 
 from notifier import send_telegram, format_smc_alert, format_gbpjpy_alert
-from strategies.smc import run_smc_scan, run_range_scan
+from strategies.smc import (run_smc_scan, run_range_scan, get_corridor,
+                             analyze_quarter_pa, diagnose_quarter_path, detect_blown_quarter)
 from strategies.gbpjpy import run_gbpjpy_confluence_check, run_kj_confluence_check
 from watcher import SetupWatcher, setup_from_smc, setup_from_gbpjpy, setup_from_kj
 from order_executor import OrderExecutor
@@ -23,6 +24,18 @@ SYMBOL_ALIASES = {
     "nzdjpy": "NZDJPY", "nj": "NZDJPY",
     "audcad": "AUDCAD", "ac": "AUDCAD",
 }
+
+def _format_corridor(corridor: dict) -> str:
+    """Single-line corridor summary for any pair."""
+    if not corridor:
+        return ""
+    zone = corridor.get("zone", "?")
+    pct = corridor.get("position_pct", 0)
+    floor_ = corridor.get("floor", "?")
+    ceiling = corridor.get("ceiling", "?")
+    zone_emoji = {"base": "🟢", "lower": "🟡", "mid": "⚪", "upper": "🟠", "top": "🔴"}.get(zone, "⚪")
+    return f"📦 Corridor: `{floor_} → {ceiling}` | {zone_emoji} `{zone} ({pct}%)`"
+
 
 def _parse_symbol(text: str):
     text_lower = text.lower()
@@ -55,6 +68,7 @@ HELP_TEXT = """
 `gbpjpy` or `kj` — full KJ top-down confluence (GBPJPY only)
 `scalp EURUSD` — scalp levels, quality rating + nearest zones for any pair
 `range GBPJPY` — range-bound setups: buy support, sell resistance
+`qpa GBPJPY` — Quarter Price Action: reads how price behaved at prior quarter levels + forecasts next move
 `scan all` — scan entire watchlist (SMC)
 `rate all` — SMC star rating for all pairs (KJ shown for GBPJPY)
 `rescan` — force immediate rescan right now
@@ -335,10 +349,11 @@ class JarvisMonitor:
             ):
                 self._notify("🔍 Running GBPJPY confluence check...")
                 result = run_gbpjpy_confluence_check(self.client)
-                score = result.get("confluence_score", "0/10")
+                score = result.get("confluence_score", "0/12")
                 valid = result.get("setup_valid") in (True, "True")
                 entry = result.get("1h_entry", {})
                 reversal = result.get("4h_reversal", {})
+                quarter = result.get("quarter", {})
 
                 # Auto-watch levels if setup valid
                 if valid:
@@ -351,6 +366,30 @@ class JarvisMonitor:
                 else:
                     watch_note = ""
 
+                corridor_line = _format_corridor(result.get("corridor"))
+                corridor = result.get("corridor", {})
+                qpa = result.get("qpa_profiles", {})
+                blown_q = result.get("blown_quarter", {})
+
+                # Floor/ceiling behavioral read
+                floor_lvl = corridor.get("floor", "?")
+                ceil_lvl = corridor.get("ceiling", "?")
+                _rtag = {"STRONG S/R": "🔒", "TRAP ZONE": "🪤", "S/R": "✅",
+                         "BROKEN": "🔓", "CONTESTED": "⚔️", "UNTESTED": "—"}
+                floor_react = qpa.get(floor_lvl, {}).get("reaction", "UNTESTED")
+                ceil_react = qpa.get(ceil_lvl, {}).get("reaction", "UNTESTED")
+                qpa_line = (f"Floor `{floor_lvl}` {_rtag.get(floor_react, '?')} {floor_react} | "
+                            f"Ceiling `{ceil_lvl}` {_rtag.get(ceil_react, '?')} {ceil_react}")
+
+                # Blown quarter note
+                blown_note = ""
+                if blown_q.get("detected"):
+                    bdir = blown_q["direction"]
+                    blvl = blown_q["broken_level"]
+                    bago = blown_q.get("bars_ago", "?")
+                    arrow = "⬆️" if bdir == "UP" else "⬇️"
+                    blown_note = f"\n{arrow} Blown quarter: broke `{blvl}` {bago}h ago — momentum confirmed"
+
                 status = "✅ SETUP VALID" if valid else "⏳ Not ready yet"
                 return (
                     f"🎯 *GBPJPY Confluence Check*\n\n"
@@ -361,9 +400,12 @@ class JarvisMonitor:
                     f"Take Profit: `{entry.get('tp', 'N/A')}`\n"
                     f"R:R: `{entry.get('rr', 'N/A')}:1`\n"
                     f"Neckline: `{reversal.get('neckline', 'N/A')}`\n"
-                    f"Lot Guidance: `{entry.get('lot_guidance', 'N/A')}`\n\n"
-                    f"_{result.get('message', '')}_"
-                    f"{watch_note}"
+                    f"Lot Guidance: `{entry.get('lot_guidance', 'N/A')}`\n"
+                    + (f"{corridor_line}\n" if corridor_line else "")
+                    + f"{qpa_line}"
+                    + blown_note
+                    + f"\n\n_{result.get('message', '')}_"
+                    + watch_note
                 )
 
             if text.startswith("tf"):
@@ -391,6 +433,13 @@ class JarvisMonitor:
             if any(text.startswith(w) for w in ("rate", "ratings", "rating")):
                 threading.Thread(target=self._bg_ratings_all, daemon=True).start()
                 return "📊 Running KJ ratings on all pairs... results incoming."
+
+            if text.startswith("qpa") or text.startswith("quarter pa") or text.startswith("quarter price"):
+                symbol = _parse_symbol(text)
+                if not symbol:
+                    return "❓ Usage: `qpa GBPJPY` or `qpa GJ`"
+                self._notify(f"📊 Analyzing quarter price action: {symbol}...")
+                return self._do_quarter_pa(symbol)
 
             if text.startswith("scalp"):
                 symbol = _parse_symbol(text)
@@ -530,12 +579,14 @@ class JarvisMonitor:
         vwap_bias = result.get("vwap", {}).get("bias", "N/A")
         tl = result.get("trendlines", {})
         tl_bias = tl.get("trend", "N/A") if tl else "N/A"
+        corridor_line = _format_corridor(result.get("corridor"))
         return (
             f"📐 *{symbol} Bias*\n\n"
             f"4H Structure: `{structure}`\n"
             f"VWAP: `{vwap_bias}`\n"
-            f"Trendline: `{tl_bias}`\n\n"
-            f"_Type `scan {symbol}` for full setup._"
+            f"Trendline: `{tl_bias}`\n"
+            + (f"{corridor_line}\n" if corridor_line else "")
+            + f"\n_Type `scan {symbol}` for full setup._"
         )
 
     def _do_pnl(self) -> str:
@@ -599,16 +650,17 @@ class JarvisMonitor:
         entry_tf = self._load_config().get("entry_timeframe", "15m")
         result = run_smc_scan(symbol, self.client, entry_tf=entry_tf)
 
+        corridor_line = _format_corridor(result.get("corridor"))
+
         # KJ is GBPJPY-specific only
         kj_line = ""
         if symbol == "GBPJPY":
             try:
                 kj = run_gbpjpy_confluence_check(self.client)
-                kj_score = int(kj.get("confluence_score", "0/10").split("/")[0])
-                kj_dir = kj.get("direction", "?")
-                kj_valid = kj_score >= 5
+                kj_score = int(kj.get("confluence_score", "0/14").split("/")[0])
+                kj_valid = kj_score >= 8
                 kj_line = (
-                    f"\n\n📐 *KJ Score: `{kj.get('confluence_score', '?/10')}`* — {kj_dir} "
+                    f"\n\n📐 *KJ Score: `{kj.get('confluence_score', '?/14')}`* "
                     f"{'✅' if kj_valid else '⏳'}"
                     f"\n_Type `kj` for full top-down breakdown._"
                 )
@@ -623,8 +675,9 @@ class JarvisMonitor:
             return (
                 f"🔍 *{symbol} Scan*\n\n"
                 f"4H Structure: `{result.get('structure', 'N/A').upper()}`\n"
-                f"VWAP Bias: `{result.get('vwap', {}).get('bias', 'N/A')}`\n\n"
-                f"SMC: No valid setup — checklist incomplete.\n"
+                f"VWAP Bias: `{result.get('vwap', {}).get('bias', 'N/A')}`\n"
+                + (f"{corridor_line}\n" if corridor_line else "")
+                + f"\nSMC: No valid setup — checklist incomplete.\n"
                 f"_Jarvis will alert when conditions align._"
                 + kj_line
             )
@@ -638,8 +691,9 @@ class JarvisMonitor:
         entry_tf = result.get("entry_tf", "15m")
         return (
             format_smc_alert(symbol, result["structure"], top) +
-            f"\nEntry TF: `{entry_tf}`" +
-            "\n\n👁 _Jarvis is now watching these levels._"
+            f"\nEntry TF: `{entry_tf}`\n"
+            + (f"{corridor_line}\n" if corridor_line else "")
+            + "\n👁 _Jarvis is now watching these levels._"
             + kj_line
         )
 
@@ -661,6 +715,7 @@ class JarvisMonitor:
             for k, v in checklist.items()
         )
 
+        corridor_line = _format_corridor(result.get("corridor"))
         reply = (
             f"🎯 *{symbol} KJ Confluence — {direction}*\n\n"
             f"Score: *{result.get('confluence_score')}* {stars} — {status}\n"
@@ -669,8 +724,9 @@ class JarvisMonitor:
             f"Entry Zone: `{entry.get('entry_zone', 'N/A')}`\n"
             f"Stop Loss: `{entry.get('sl', 'N/A')}`\n"
             f"Take Profit: `{entry.get('tp', 'N/A')}`\n"
-            f"R:R: `{entry.get('rr', 'N/A')}:1`\n\n"
-            f"*Checklist:*\n{check_lines}\n\n"
+            f"R:R: `{entry.get('rr', 'N/A')}:1`\n"
+            + (f"{corridor_line}\n" if corridor_line else "")
+            + f"\n*Checklist:*\n{check_lines}\n\n"
             f"_{result.get('message', '')}_"
         )
 
@@ -716,13 +772,13 @@ class JarvisMonitor:
 
                 if symbol == "GBPJPY":
                     kj = run_gbpjpy_confluence_check(self.client)
-                    kj_raw = int(kj.get("confluence_score", "0/10").split("/")[0])
-                    kj_valid = kj_raw >= 5
+                    kj_raw = int(kj.get("confluence_score", "0/14").split("/")[0])
+                    kj_valid = kj_raw >= 8
                     direction = kj.get("direction", direction)
                     score = kj_raw
                     valid_tag = "✅" if kj_valid else "·"
                     rows.append(
-                        f"{valid_tag} `{symbol:<7}` {_stars(kj_raw, 10)}  KJ `{kj_raw}/10` SMC `{smc_int}/5` — {direction}"
+                        f"{valid_tag} `{symbol:<7}` {_stars(kj_raw, 14)}  KJ `{kj_raw}/14` SMC `{smc_int}/5` — {direction}"
                     )
                 else:
                     valid_tag = "✅" if smc.get("valid_setups") else "·"
@@ -755,6 +811,15 @@ class JarvisMonitor:
         current_price = result.get("current_price")
         scalp_setups = [s for s in result.get("valid_setups", []) if s.get("trade_type") == "SCALP"]
 
+        # Quarter price action — behavioral context for the scalp
+        try:
+            df_1h = self.client.get_candles(symbol, "1H", bars=350)
+            qpa_profiles = analyze_quarter_pa(symbol, df_1h, current_price or df_1h["close"].iloc[-1])
+            blown_q = detect_blown_quarter(symbol, df_1h)
+        except Exception:
+            qpa_profiles = {}
+            blown_q = {"detected": False}
+
         # Find nearest zones to current price
         def _nearest(zones):
             if not zones or not current_price:
@@ -773,20 +838,40 @@ class JarvisMonitor:
         else:
             if structure in ("bullish", "bearish"):
                 rating += 1
-            if current_price and near_demand:
-                demand_mid = (near_demand["top"] + near_demand["bottom"]) / 2
-                dist_pct = abs(current_price - demand_mid) / current_price * 100
-                if dist_pct < 0.15:
-                    rating += 2; scalp_dir = "LONG"
-                elif dist_pct < 0.4:
-                    rating += 1; scalp_dir = "LONG"
-            if current_price and near_supply:
-                supply_mid = (near_supply["top"] + near_supply["bottom"]) / 2
-                dist_pct = abs(current_price - supply_mid) / current_price * 100
-                if dist_pct < 0.15:
-                    rating += 2; scalp_dir = "SHORT"
-                elif dist_pct < 0.4:
-                    rating += 1; scalp_dir = "SHORT"
+            if structure == "bullish":
+                # Scalp = counter-trend SHORT: price must reach supply before reversing
+                if current_price and near_supply:
+                    supply_mid = (near_supply["top"] + near_supply["bottom"]) / 2
+                    dist_pct = abs(current_price - supply_mid) / current_price * 100
+                    if dist_pct < 0.15:
+                        rating += 2; scalp_dir = "SHORT"
+                    elif dist_pct < 0.4:
+                        rating += 1; scalp_dir = "SHORT"
+            elif structure == "bearish":
+                # Scalp = counter-trend LONG: price must reach demand before reversing
+                if current_price and near_demand:
+                    demand_mid = (near_demand["top"] + near_demand["bottom"]) / 2
+                    dist_pct = abs(current_price - demand_mid) / current_price * 100
+                    if dist_pct < 0.15:
+                        rating += 2; scalp_dir = "LONG"
+                    elif dist_pct < 0.4:
+                        rating += 1; scalp_dir = "LONG"
+            else:
+                # Ranging: either direction, nearest zone wins
+                if current_price and near_demand:
+                    demand_mid = (near_demand["top"] + near_demand["bottom"]) / 2
+                    dist_pct = abs(current_price - demand_mid) / current_price * 100
+                    if dist_pct < 0.15:
+                        rating += 2; scalp_dir = "LONG"
+                    elif dist_pct < 0.4:
+                        rating += 1; scalp_dir = "LONG"
+                if current_price and near_supply:
+                    supply_mid = (near_supply["top"] + near_supply["bottom"]) / 2
+                    dist_pct = abs(current_price - supply_mid) / current_price * 100
+                    if dist_pct < 0.15:
+                        rating += 2; scalp_dir = "SHORT"
+                    elif dist_pct < 0.4:
+                        rating += 1; scalp_dir = "SHORT"
             rating = min(rating, 4)
 
         stars = "⭐" * rating
@@ -800,6 +885,48 @@ class JarvisMonitor:
             lines.append(f"📕 Nearest Supply Zone: `{near_supply['bottom']} – {near_supply['top']}`")
         if current_price:
             lines.append(f"💱 Current Price: `{current_price}`")
+            corridor = result.get("corridor") or get_corridor(symbol, current_price)
+            lines.append(_format_corridor(corridor))
+
+            # Quarter behavioral read for the current floor/ceiling
+            _rtag = {"STRONG S/R": "🔒", "TRAP ZONE": "🪤", "S/R": "✅",
+                     "BROKEN": "🔓", "CONTESTED": "⚔️", "UNTESTED": "—"}
+            floor_react = qpa_profiles.get(corridor.get("floor"), {}).get("reaction", "UNTESTED")
+            ceil_react = qpa_profiles.get(corridor.get("ceiling"), {}).get("reaction", "UNTESTED")
+            lines.append(
+                f"Floor `{corridor.get('floor')}` {_rtag.get(floor_react,'?')} {floor_react} | "
+                f"Ceiling `{corridor.get('ceiling')}` {_rtag.get(ceil_react,'?')} {ceil_react}"
+            )
+
+            # Blown quarter reversal detection
+            if blown_q.get("detected"):
+                bdir = blown_q["direction"]
+                blvl = blown_q["broken_level"]
+                bago = blown_q.get("bars_ago", "?")
+                # Bullish blow + strong ceiling = short scalp opportunity
+                if bdir == "UP" and ceil_react in ("STRONG S/R", "S/R", "TRAP ZONE"):
+                    lines.append(
+                        f"\n🚨 *BLOWN QUARTER REVERSAL*\n"
+                        f"Price broke `{blvl}` upward {bago}h ago → now pressing `{corridor.get('ceiling')}`\n"
+                        f"Ceiling reaction: {ceil_react} — HIGH probability SHORT back to `{blvl}`\n"
+                        f"_Watch for 5m rejection candle at `{corridor.get('ceiling')}` to confirm_"
+                    )
+                    if rating < 4:
+                        rating = 4
+                        scalp_dir = "SHORT"
+                elif bdir == "DOWN" and floor_react in ("STRONG S/R", "S/R", "TRAP ZONE"):
+                    lines.append(
+                        f"\n🚨 *BLOWN QUARTER REVERSAL*\n"
+                        f"Price broke `{blvl}` downward {bago}h ago → now pressing `{corridor.get('floor')}`\n"
+                        f"Floor reaction: {floor_react} — HIGH probability LONG back to `{blvl}`\n"
+                        f"_Watch for 5m rejection candle at `{corridor.get('floor')}` to confirm_"
+                    )
+                    if rating < 4:
+                        rating = 4
+                        scalp_dir = "LONG"
+                else:
+                    arrow = "⬆️" if bdir == "UP" else "⬇️"
+                    lines.append(f"{arrow} Blown quarter: broke `{blvl}` {bago}h ago")
 
         if scalp_setups:
             top = scalp_setups[0]
@@ -813,9 +940,77 @@ class JarvisMonitor:
             self.watcher.add(watched, tick_price)
             lines.append("\n👁 _Jarvis is watching these levels._")
         else:
-            lines.append(f"\n⏳ No confirmed scalp setup — wait for price to reach zone, then look for a 5m flip.")
+            if structure == "bullish" and near_supply:
+                lines.append(f"\n⏳ No confirmed scalp yet — wait for price to hit supply `{near_supply['bottom']} – {near_supply['top']}`, then look for 5m flip SHORT back into FVG/range.")
+            elif structure == "bearish" and near_demand:
+                lines.append(f"\n⏳ No confirmed scalp yet — wait for price to hit demand `{near_demand['bottom']} – {near_demand['top']}`, then look for 5m flip LONG back into FVG/range.")
+            else:
+                lines.append(f"\n⏳ No confirmed scalp setup — wait for price to reach nearest zone, then look for a 5m flip.")
 
-        lines.append(f"\n_Scalp = counter-trend. Smaller size, quick exit._")
+        lines.append(f"\n_Scalp = counter-trend reversal back into range/FVG. Smaller size, quick exit._")
+        return "\n".join(lines)
+
+    def _do_quarter_pa(self, symbol: str) -> str:
+        """Quarter Price Action — diagnoses how price has behaved at prior quarter levels."""
+        try:
+            df = self.client.get_candles(symbol, "1H", bars=350)
+        except Exception as e:
+            return f"❌ Couldn't fetch candles for {symbol}: {e}"
+
+        try:
+            current_price = self.client.get_tick(symbol)["price"]
+        except Exception:
+            current_price = float(df["close"].iloc[-1])
+
+        profiles = analyze_quarter_pa(symbol, df, current_price)
+        diagnosis = diagnose_quarter_path(symbol, current_price, profiles)
+
+        corridor = diagnosis["corridor"]
+        floor_lvl = diagnosis["floor"]
+        ceil_lvl = diagnosis["ceiling"]
+        interval = corridor["interval"]
+
+        lines = [f"📊 *{symbol} — Quarter Price Action*\n"]
+        lines.append(
+            f"Price: `{round(current_price, 5)}` | "
+            f"Corridor: `{floor_lvl} → {ceil_lvl}` | "
+            f"Position: `{corridor['zone']} ({corridor['position_pct']}%)`\n"
+        )
+
+        # Show profiles for current corridor + one above and below
+        levels_to_show = [
+            round(floor_lvl - interval, 5),
+            floor_lvl,
+            ceil_lvl,
+            round(ceil_lvl + interval, 5),
+        ]
+        reaction_tags = {
+            "STRONG S/R": "🔒", "TRAP ZONE": "🪤", "S/R": "✅",
+            "BROKEN": "🔓", "CONTESTED": "⚔️",
+        }
+        level_lines = []
+        for lvl in levels_to_show:
+            p = profiles.get(lvl)
+            marker = "▶" if floor_lvl <= round(current_price, 5) <= ceil_lvl and lvl in (floor_lvl, ceil_lvl) else " "
+            if p:
+                tag = reaction_tags.get(p["reaction"], "?")
+                fb_note = f" · false brk ×{p['false_breaks']}" if p["false_breaks"] else ""
+                level_lines.append(
+                    f"{marker} `{lvl}` {tag} {p['reaction']} "
+                    f"— {p['touches']}×touched, rej {p['rejects']} brk {p['breaks']}{fb_note}"
+                )
+            else:
+                level_lines.append(f"{marker} `{lvl}` — untested")
+        lines.append("*Quarter Level History:*\n" + "\n".join(level_lines))
+
+        lines.append("\n*Read:*")
+        for d in diagnosis["diagnosis"]:
+            lines.append(f"  {d}")
+
+        lines.append("\n*Forecast:*")
+        for f in diagnosis["forecast"]:
+            lines.append(f"  {f}")
+
         return "\n".join(lines)
 
     def _do_range_scan(self, symbol: str) -> str:
