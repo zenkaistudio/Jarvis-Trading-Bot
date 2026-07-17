@@ -10,7 +10,7 @@ import pandas as pd
 
 from .smc import (_pivot_highs, _pivot_lows, calculate_vwap, get_trendlines,
                    find_supply_zones, find_demand_zones, get_corridor,
-                   analyze_quarter_pa, detect_blown_quarter)
+                   analyze_quarter_pa, detect_blown_quarter, find_fvg)
 
 
 SYMBOL = "GBPJPY"
@@ -18,37 +18,41 @@ SYMBOL = "GBPJPY"
 
 # ── Step 1 — Monthly: R/S Flip Zone ─────────────────────────────────────────
 
-def check_monthly_rs_flip(df_monthly: pd.DataFrame) -> dict:
+def check_monthly_rs_flip(df_monthly: pd.DataFrame, direction: str = "LONG") -> dict:
     """
-    Look for prior resistance that price broke through and is now retesting as support.
-    Signal: current price is pulling back into a former resistance level.
+    LONG: prior resistance broke above, now retesting as support.
+    SHORT: prior support broke below, now retesting as resistance.
     """
-    ph = _pivot_highs(df_monthly, left=2, right=2)
-    if len(ph) < 2:
-        return {"found": False, "reason": "Not enough monthly pivot highs"}
-
     current_price = df_monthly["close"].iloc[-1]
 
-    # Find a prior resistance that price broke above and is now near
-    for pivot in reversed(ph[:-1]):
-        level = pivot["price"]
-        broke_above = any(
-            df_monthly["close"].iloc[i] > level
-            for i in range(pivot["index"] + 1, len(df_monthly))
-        )
-        near_level = abs(current_price - level) / level < 0.02  # within 2%
-        price_above = current_price > level * 0.995  # price holding above
-
-        if broke_above and price_above:
-            return {
-                "found": True,
-                "zone_level": round(level, 3),
-                "current_price": round(current_price, 3),
-                "near_level": near_level,
-                "signal": "Price retesting former resistance as support (R/S flip)",
-            }
-
-    return {"found": False, "reason": "No R/S flip zone identified on monthly"}
+    if direction == "LONG":
+        ph = _pivot_highs(df_monthly, left=2, right=2)
+        if len(ph) < 2:
+            return {"found": False, "reason": "Not enough monthly pivot highs"}
+        for pivot in reversed(ph[:-1]):
+            level = pivot["price"]
+            broke_above = any(df_monthly["close"].iloc[i] > level
+                              for i in range(pivot["index"] + 1, len(df_monthly)))
+            if broke_above and current_price > level * 0.995:
+                return {"found": True, "zone_level": round(level, 3),
+                        "current_price": round(current_price, 3),
+                        "near_level": abs(current_price - level) / level < 0.02,
+                        "signal": "Price retesting former resistance as support (R/S flip)"}
+        return {"found": False, "reason": "No R/S flip zone on monthly (LONG)"}
+    else:
+        pl = _pivot_lows(df_monthly, left=2, right=2)
+        if len(pl) < 2:
+            return {"found": False, "reason": "Not enough monthly pivot lows"}
+        for pivot in reversed(pl[:-1]):
+            level = pivot["price"]
+            broke_below = any(df_monthly["close"].iloc[i] < level
+                              for i in range(pivot["index"] + 1, len(df_monthly)))
+            if broke_below and current_price < level * 1.005:
+                return {"found": True, "zone_level": round(level, 3),
+                        "current_price": round(current_price, 3),
+                        "near_level": abs(current_price - level) / level < 0.02,
+                        "signal": "Price retesting former support as resistance (S/R flip SHORT)"}
+        return {"found": False, "reason": "No S/R flip zone on monthly (SHORT)"}
 
 
 # ── Step 2 — Weekly: Bullish Intent ─────────────────────────────────────────
@@ -257,6 +261,100 @@ def get_1h_entry(df_1h: pd.DataFrame, zone_level: float, pattern_info: dict) -> 
     }
 
 
+# ── Candle Reaction — Final Tell ─────────────────────────────────────────────
+
+def check_candle_reaction(df_1h: pd.DataFrame, df_4h: pd.DataFrame,
+                          zone_level: float, direction: str) -> dict:
+    """
+    Final confirmation layer — how are candles actually behaving at the zone?
+    Checks wick rejections, order block presence, body strength, TF alignment,
+    and engulfing patterns. direction: 'LONG' or 'SHORT'.
+    """
+    # ── Wick rejection at zone (last 5 1H candles) ──
+    wick_rejections = 0
+    for _, c in df_1h.tail(5).iterrows():
+        pin = c["low"] if direction == "LONG" else c["high"]
+        if abs(pin - zone_level) / zone_level > 0.005:
+            continue
+        body = abs(c["close"] - c["open"])
+        if direction == "LONG":
+            wick = min(c["open"], c["close"]) - c["low"]
+            if wick > body and c["close"] > c["open"]:
+                wick_rejections += 1
+        else:
+            wick = c["high"] - max(c["open"], c["close"])
+            if wick > body and c["close"] < c["open"]:
+                wick_rejections += 1
+
+    # ── Order block — last opposite-direction 4H candle before current move ──
+    ob_found = False
+    ob_zone = None
+    ob_level = None
+    for i in range(len(df_4h) - 1, max(len(df_4h) - 20, -1), -1):
+        row = df_4h.iloc[i]
+        is_opposite = (row["close"] < row["open"]) if direction == "LONG" else (row["close"] > row["open"])
+        if is_opposite:
+            ob_found = True
+            ob_level = round(row["high"] if direction == "LONG" else row["low"], 3)
+            ob_zone = f"{round(row['low'], 3)} — {round(row['high'], 3)}"
+            break
+
+    # ── Current 1H candle quality ──
+    curr = df_1h.iloc[-1]
+    candle_range = curr["high"] - curr["low"]
+    body_size = abs(curr["close"] - curr["open"])
+    body_ratio = body_size / candle_range if candle_range > 0 else 0
+    body_strong = body_ratio > 0.5
+
+    if candle_range > 0:
+        if direction == "LONG":
+            close_pos = (curr["close"] - curr["low"]) / candle_range
+        else:
+            close_pos = (curr["high"] - curr["close"]) / candle_range
+    else:
+        close_pos = 0
+    closing_right = close_pos > 0.6
+
+    # ── 4H + 1H alignment ──
+    curr_4h = df_4h.iloc[-1]
+    if direction == "LONG":
+        tf_aligned = curr_4h["close"] > curr_4h["open"] and curr["close"] > curr["open"]
+    else:
+        tf_aligned = curr_4h["close"] < curr_4h["open"] and curr["close"] < curr["open"]
+
+    # ── Engulfing (1H) ──
+    engulfing = False
+    if len(df_1h) >= 2:
+        prev = df_1h.iloc[-2]
+        if direction == "LONG":
+            engulfing = (curr["close"] > curr["open"] and prev["close"] < prev["open"]
+                         and curr["close"] > prev["open"] and curr["open"] < prev["close"])
+        else:
+            engulfing = (curr["close"] < curr["open"] and prev["close"] > prev["open"]
+                         and curr["close"] < prev["open"] and curr["open"] > prev["close"])
+
+    passed = sum([wick_rejections >= 1, ob_found, body_strong, closing_right, tf_aligned, engulfing])
+
+    return {
+        "wick_rejections": wick_rejections,
+        "order_block_found": ob_found,
+        "order_block_zone": ob_zone,
+        "order_block_level": ob_level,
+        "body_ratio": round(body_ratio, 2),
+        "body_strong": body_strong,
+        "closing_right": closing_right,
+        "tf_aligned_4h_1h": tf_aligned,
+        "engulfing": engulfing,
+        "checks_passed": passed,
+        "confirmed": passed >= 3,
+        "signal": (
+            f"PA confirming — {passed}/6 candle checks ✓"
+            if passed >= 3
+            else f"PA inconclusive — only {passed}/6 candle checks"
+        ),
+    }
+
+
 # ── Quarter Level Theory (GBPJPY-specific) ───────────────────────────────────
 
 def _nearest_quarter_level(price: float) -> float:
@@ -290,6 +388,72 @@ def check_quarter_level_confluence(zone_level: float, tp_level: float) -> dict:
     }
 
 
+# ── FVG Proximity Check ───────────────────────────────────────────────────────
+
+def _fvg_near_zone(fvgs: list, zone_level: float, direction: str,
+                   interval: float = 0.25) -> dict:
+    """Most recent FVG whose midpoint is within one quarter-interval of zone_level."""
+    for fvg in reversed(fvgs):
+        if direction == "LONG" and fvg["type"] == "bullish":
+            if abs(fvg["fvb"] - zone_level) <= interval:
+                return {"found": True, "type": "bullish",
+                        "zone": f"{fvg['fvl']} — {fvg['fvh']}",
+                        "midpoint": fvg["fvb"], "time": fvg["time"]}
+        elif direction == "SHORT" and fvg["type"] == "bearish":
+            if abs(fvg["fvb"] - zone_level) <= interval:
+                return {"found": True, "type": "bearish",
+                        "zone": f"{fvg['fvl']} — {fvg['fvh']}",
+                        "midpoint": fvg["fvb"], "time": fvg["time"]}
+    return {"found": False}
+
+
+# ── 15m CHoCH / BOS ───────────────────────────────────────────────────────────
+
+def detect_choch_bos(df_15m: pd.DataFrame, direction: str) -> dict:
+    """
+    CHoCH (Change of Character): first break of opposing swing structure on 15m — signals shift.
+    BOS (Break of Structure): each new swing confirms continuation.
+    SHORT: looks for a close below a prior swing low.
+    LONG: looks for a close above a prior swing high.
+    """
+    if df_15m is None or len(df_15m) < 10:
+        return {"confirmed": False, "type": None, "signal": "Insufficient 15m data"}
+
+    current_price = df_15m["close"].iloc[-1]
+
+    if direction == "SHORT":
+        pl = _pivot_lows(df_15m, left=2, right=2)
+        if len(pl) < 2:
+            return {"confirmed": False, "type": None, "signal": "No 15m swing lows for CHoCH"}
+        prev_low = pl[-2]["price"]
+        last_low = pl[-1]["price"]
+        bos = last_low < prev_low
+        choch = current_price < prev_low and not bos
+        confirmed = bos or choch
+        structure_type = "CHoCH" if choch else ("BOS" if bos else None)
+        broken_level = round(prev_low, 3)
+    else:
+        ph = _pivot_highs(df_15m, left=2, right=2)
+        if len(ph) < 2:
+            return {"confirmed": False, "type": None, "signal": "No 15m swing highs for CHoCH"}
+        prev_high = ph[-2]["price"]
+        last_high = ph[-1]["price"]
+        bos = last_high > prev_high
+        choch = current_price > prev_high and not bos
+        confirmed = bos or choch
+        structure_type = "CHoCH" if choch else ("BOS" if bos else None)
+        broken_level = round(prev_high, 3)
+
+    return {
+        "confirmed": confirmed,
+        "type": structure_type,
+        "broken_level": broken_level,
+        "current_price": round(current_price, 3),
+        "signal": (f"15m {structure_type} @ {broken_level} ✓"
+                   if confirmed else f"No 15m structure break ({direction})"),
+    }
+
+
 # ── Full GBPJPY Confluence Check ─────────────────────────────────────────────
 
 def _resample_daily_to(df_daily: pd.DataFrame, freq: str) -> pd.DataFrame:
@@ -304,89 +468,122 @@ def _resample_daily_to(df_daily: pd.DataFrame, freq: str) -> pd.DataFrame:
     return resampled
 
 
-def run_gbpjpy_confluence_check(client) -> dict:
+def run_gbpjpy_confluence_check(client, direction: str = "LONG") -> dict:
     """
     Full top-down confluence check for GBPJPY.
-    Uses 1D data resampled to monthly/weekly (TradeLocker doesn't support 1M/1W).
-    Minimum 5/10 score required to flag setup.
+    direction: 'LONG' or 'SHORT' — all checks flip accordingly.
+
+    14-item tiered checklist:
+      CRITICAL (5): monthly flip, 4H reversal, blown quarter, candle reaction, order block
+      HIGH (4):     quarter level strength, weekly wicks, FVG near zone, 15m CHoCH/BOS
+      MEDIUM (5):   VWAP, trendline, daily rejection closes, daily compression, corridor position
+    Threshold: 8/14
     """
-    # Fetch only supported resolutions — resample up for monthly/weekly
     df_daily_long = client.get_candles(SYMBOL, "1D", bars=500)
     df_monthly = _resample_daily_to(df_daily_long, "monthly")
     df_weekly = _resample_daily_to(df_daily_long, "weekly")
     df_daily = df_daily_long.tail(60).reset_index(drop=True)
     df_4h = client.get_candles(SYMBOL, "4H", bars=120)
     df_1h = client.get_candles(SYMBOL, "1H", bars=200)
+    try:
+        df_15m = client.get_candles(SYMBOL, "15m", bars=100)
+    except Exception:
+        df_15m = None
 
-    # Step 1: Monthly R/S flip
-    monthly = check_monthly_rs_flip(df_monthly)
+    monthly = check_monthly_rs_flip(df_monthly, direction)
     zone_level = monthly.get("zone_level", df_daily["close"].iloc[-1])
 
-    # Step 2: Weekly bullish intent
-    weekly = check_weekly_bullish_intent(df_weekly, zone_level)
-
-    # Step 3: Daily validation
+    weekly = _check_weekly_intent(df_weekly, zone_level, direction)
     daily = check_daily_validation(df_daily, zone_level)
 
-    # Step 4: 4H reversal pattern
-    reversal = check_4h_reversal_pattern(df_4h, zone_level)
+    if direction == "LONG":
+        reversal = check_4h_reversal_pattern(df_4h, zone_level)
+        entry = get_1h_entry(df_1h, zone_level, reversal)
+        entry_vwap_ok = entry["price_above_vwap"]
+        entry_tl_ok = bool(entry["trendlines"].get("support_trendline", {}).get("price_near_line"))
+    else:
+        reversal = _check_4h_reversal_generic(df_4h, zone_level, direction)
+        entry = _get_1h_entry_generic(df_1h, zone_level, reversal, direction)
+        entry_vwap_ok = entry["vwap_aligned"]
+        entry_tl_ok = entry["trendline_near"]
 
-    # Step 5: 1H entry
-    entry = get_1h_entry(df_1h, zone_level, reversal)
-
-    # Step 6: Quarter level proximity (still used for TP alignment display)
     quarter = check_quarter_level_confluence(zone_level, entry["tp"])
-
-    # Step 7: Corridor position
     current_price = df_1h["close"].iloc[-1]
     corridor = get_corridor(SYMBOL, current_price)
 
-    # Step 8: Quarter price action — behavioral history at current floor/ceiling
     qpa_profiles = analyze_quarter_pa(SYMBOL, df_1h, current_price)
-    floor_lvl = corridor["floor"]
-    ceil_lvl = corridor["ceiling"]
-    floor_profile = qpa_profiles.get(floor_lvl, {})
-    ceil_profile = qpa_profiles.get(ceil_lvl, {})
-
-    # Floor is "strong" if it has a history of holding (not just proximity to a .25/.50/.75)
+    floor_profile = qpa_profiles.get(corridor["floor"], {})
+    ceil_profile = qpa_profiles.get(corridor["ceiling"], {})
     floor_reaction = floor_profile.get("reaction", "UNTESTED")
-    quarter_floor_strong = floor_reaction in ("STRONG S/R", "S/R", "TRAP ZONE")
-
-    # Ceiling toward TP is "clear" if price has broken through it before or it's untested
-    # A STRONG S/R ceiling means TP is blocked — not ideal
     ceil_reaction = ceil_profile.get("reaction", "UNTESTED")
-    quarter_ceiling_clear = ceil_reaction not in ("STRONG S/R", "S/R")
 
-    # Step 9: Blown quarter — aggressive bullish break through a quarter level recently
+    if direction == "LONG":
+        quarter_level_strong = floor_reaction in ("STRONG S/R", "S/R", "TRAP ZONE")
+        quarter_path_clear = ceil_reaction not in ("STRONG S/R", "S/R")
+        corridor_position_ok = corridor["zone"] in ("base", "lower")
+        blown_directional = blown_q_dir = "UP"
+    else:
+        quarter_level_strong = ceil_reaction in ("STRONG S/R", "S/R", "TRAP ZONE")
+        quarter_path_clear = floor_reaction not in ("STRONG S/R", "S/R")
+        corridor_position_ok = corridor["zone"] in ("upper", "top")
+        blown_directional = blown_q_dir = "DOWN"
+
     blown_q = detect_blown_quarter(SYMBOL, df_1h)
-    blown_quarter_bullish = blown_q.get("detected", False) and blown_q.get("direction") == "UP"
+    blown_momentum = blown_q.get("detected", False) and blown_q.get("direction") == blown_q_dir
 
-    # Confluence scoring (14 possible points — KJ checklist + behavioral quarter + corridor)
+    candle_pa = check_candle_reaction(df_1h, df_4h, zone_level, direction)
+
+    fvgs_1h = find_fvg(df_1h)
+    fvg_check = _fvg_near_zone(fvgs_1h, zone_level, direction)
+
+    choch = detect_choch_bos(df_15m, direction)
+
+    daily_compression = daily["candle_size_decreasing"] or daily["consolidating"]
+
     checklist = {
-        "monthly_rs_flip": monthly["found"],
-        "weekly_wick_rejections": weekly["rejection_wicks"] >= 2,
-        "weekly_bullish_closes": weekly["bullish_closes"] >= 1,
-        "daily_rejection_closes": daily["rejection_closes"] >= 3,
-        "daily_candle_size_decreasing": daily["candle_size_decreasing"],
-        "daily_consolidation": daily["consolidating"],
-        "4h_reversal_pattern": reversal["found"],
-        "1h_entry_in_zone": entry["position_in_zone"] in ("bottom", "mid"),
-        "vwap_aligned": entry["price_above_vwap"],
-        "trendline_confluence": bool(entry["trendlines"].get("support_trendline", {}).get("price_near_line")),
-        "quarter_floor_strong": quarter_floor_strong,       # floor has behavioral history of holding
-        "quarter_ceiling_clear": quarter_ceiling_clear,     # TP path not blocked by a proven wall
-        "corridor_entry_bottom": corridor["zone"] in ("base", "lower"),
-        "blown_quarter_momentum": blown_quarter_bullish,    # recent aggressive bullish break confirms intent
+        # ── CRITICAL ──────────────────────────────────────────────────────────
+        "monthly_rs_flip":         monthly["found"],
+        "4h_reversal_pattern":     reversal["found"],
+        "blown_quarter_momentum":  blown_momentum,
+        "candle_reaction_at_zone": candle_pa["wick_rejections"] >= 1 or candle_pa["engulfing"],
+        "order_block_confirmed":   candle_pa["order_block_found"] and candle_pa["tf_aligned_4h_1h"],
+        # ── HIGH ──────────────────────────────────────────────────────────────
+        "quarter_level_strong":    quarter_level_strong,
+        "weekly_wick_rejections":  weekly["rejection_wicks"] >= 2,
+        "fvg_near_zone":           fvg_check["found"],
+        "choch_bos_15m":           choch["confirmed"],
+        # ── MEDIUM ────────────────────────────────────────────────────────────
+        "vwap_aligned":            entry_vwap_ok,
+        "trendline_confluence":    entry_tl_ok,
+        "daily_rejection_closes":  daily["rejection_closes"] >= 3,
+        "daily_compression":       daily_compression,
+        "corridor_position":       corridor_position_ok,
     }
 
     score = sum(checklist.values())
     setup_valid = score >= 8
 
+    critical_score = sum(checklist[k] for k in
+        ["monthly_rs_flip", "4h_reversal_pattern", "blown_quarter_momentum",
+         "candle_reaction_at_zone", "order_block_confirmed"])
+    high_score = sum(checklist[k] for k in
+        ["quarter_level_strong", "weekly_wick_rejections", "fvg_near_zone", "choch_bos_15m"])
+
     return {
         "symbol": SYMBOL,
+        "direction": direction,
         "confluence_score": f"{score}/14",
+        "critical_score": f"{critical_score}/5",
+        "high_score": f"{high_score}/4",
         "setup_valid": setup_valid,
         "checklist": checklist,
+        "checklist_tiers": {
+            "CRITICAL": ["monthly_rs_flip", "4h_reversal_pattern", "blown_quarter_momentum",
+                         "candle_reaction_at_zone", "order_block_confirmed"],
+            "HIGH":     ["quarter_level_strong", "weekly_wick_rejections", "fvg_near_zone", "choch_bos_15m"],
+            "MEDIUM":   ["vwap_aligned", "trendline_confluence", "daily_rejection_closes",
+                         "daily_compression", "corridor_position"],
+        },
         "monthly": monthly,
         "weekly": weekly,
         "daily": daily,
@@ -396,10 +593,16 @@ def run_gbpjpy_confluence_check(client) -> dict:
         "corridor": corridor,
         "qpa_profiles": qpa_profiles,
         "blown_quarter": blown_q,
+        "candle_reaction": candle_pa,
+        "fvg": fvg_check,
+        "choch_bos": choch,
         "message": (
-            f"SETUP CONFIRMED — {score}/14 confluences. {reversal.get('entry_signal', '')}"
+            f"SETUP CONFIRMED ({direction}) — {score}/14 | Critical {critical_score}/5 | "
+            f"FVG: {'✓' if fvg_check['found'] else '✗'} | CHoCH: {'✓' if choch['confirmed'] else '✗'} | "
+            f"{reversal.get('entry_signal', '')}"
             if setup_valid
-            else f"Not ready — only {score}/14 confluences (need 8+). Keep monitoring."
+            else f"Not ready ({direction}) — {score}/14 (need 8+). Critical: {critical_score}/5. "
+                 f"Missing: {', '.join(k for k, v in checklist.items() if not v)}"
         ),
     }
 
@@ -607,6 +810,10 @@ def run_kj_confluence_check(symbol: str, client) -> dict:
     df_daily = df_daily_full.tail(60).reset_index(drop=True)
     df_4h = client.get_candles(symbol, "4H", bars=120)
     df_1h = client.get_candles(symbol, "1H", bars=200)
+    try:
+        df_15m = client.get_candles(symbol, "15m", bars=100)
+    except Exception:
+        df_15m = None
 
     best_result = None
     best_score = -1
@@ -619,18 +826,31 @@ def run_kj_confluence_check(symbol: str, client) -> dict:
         daily = _check_daily_validation_generic(df_daily, zone_level, direction)
         reversal = _check_4h_reversal_generic(df_4h, zone_level, direction)
         entry = _get_1h_entry_generic(df_1h, zone_level, reversal, direction)
+        candle_pa = check_candle_reaction(df_1h, df_4h, zone_level, direction)
+
+        fvgs_1h = find_fvg(df_1h)
+        fvg_check = _fvg_near_zone(fvgs_1h, zone_level, direction)
+        choch = detect_choch_bos(df_15m, direction)
+        daily_compression = daily["candle_size_decreasing"] or daily["consolidating"]
 
         checklist = {
-            "key_level_identified": key["found"],
-            "weekly_wick_rejections": weekly["rejection_wicks"] >= 2,
+            # ── CRITICAL ──────────────────────────────────────────────────────
+            "key_level_identified":    key["found"],
+            "4h_reversal_pattern":     reversal["found"],
+            "candle_reaction_at_zone": candle_pa["wick_rejections"] >= 1 or candle_pa["engulfing"],
+            "order_block_confirmed":   candle_pa["order_block_found"] and candle_pa["tf_aligned_4h_1h"],
+            # ── HIGH ──────────────────────────────────────────────────────────
+            "weekly_wick_rejections":  weekly["rejection_wicks"] >= 2,
+            "fvg_near_zone":           fvg_check["found"],
+            "choch_bos_15m":           choch["confirmed"],
+            # ── MEDIUM ────────────────────────────────────────────────────────
             "weekly_directional_closes": weekly["directional_closes"] >= 1,
-            "daily_rejection_closes": daily["rejection_closes"] >= 3,
-            "daily_candle_size_decreasing": daily["candle_size_decreasing"],
-            "daily_consolidation": daily["consolidating"],
-            "4h_reversal_pattern": reversal["found"],
-            "1h_entry_in_zone": entry["position_in_zone"] in ("bottom", "mid", "top"),
-            "vwap_aligned": entry["vwap_aligned"],
-            "trendline_confluence": entry["trendline_near"],
+            "daily_rejection_closes":  daily["rejection_closes"] >= 3,
+            "daily_compression":       daily_compression,
+            "vwap_aligned":            entry["vwap_aligned"],
+            "trendline_confluence":    entry["trendline_near"],
+            "1h_entry_in_zone":        entry["position_in_zone"] in ("bottom", "mid", "top"),
+            "pa_signal_strength":      candle_pa["checks_passed"] >= 3,
         }
         score = sum(checklist.values())
 
@@ -639,24 +859,31 @@ def run_kj_confluence_check(symbol: str, client) -> dict:
             best_result = {
                 "symbol": symbol,
                 "direction": direction,
-                "confluence_score": f"{score}/10",
+                "confluence_score": f"{score}/14",
                 "raw_score": score,
-                "setup_valid": score >= 5,
+                "setup_valid": score >= 7,
                 "checklist": checklist,
                 "key_level": key,
                 "weekly": weekly,
                 "daily": daily,
                 "4h_reversal": reversal,
                 "1h_entry": entry,
+                "candle_reaction": candle_pa,
+                "fvg": fvg_check,
+                "choch_bos": choch,
                 "message": (
-                    f"SETUP CONFIRMED — {score}/10. {reversal.get('entry_signal', '')}"
-                    if score >= 5
-                    else f"Not ready — {score}/10 confluences (need 5+)."
+                    f"SETUP CONFIRMED ({direction}) — {score}/14. "
+                    f"FVG: {'✓' if fvg_check['found'] else '✗'} | "
+                    f"CHoCH: {'✓' if choch['confirmed'] else '✗'} | "
+                    f"{reversal.get('entry_signal', '')}"
+                    if score >= 7
+                    else f"Not ready ({direction}) — {score}/14 (need 7+). "
+                         f"Missing: {', '.join(k for k, v in checklist.items() if not v)}"
                 ),
             }
 
     return best_result or {
         "symbol": symbol, "direction": "LONG",
-        "confluence_score": "0/10", "raw_score": 0, "setup_valid": False,
+        "confluence_score": "0/14", "raw_score": 0, "setup_valid": False,
         "message": "Could not identify key levels.",
     }

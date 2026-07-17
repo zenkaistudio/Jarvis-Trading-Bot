@@ -48,6 +48,16 @@ def _parse_symbol(text: str):
     return None
 
 
+def _parse_direction(text: str):
+    """Returns 'SHORT', 'LONG', or None."""
+    t = text.lower()
+    if any(w in t for w in ("short", "sell", "bear")):
+        return "SHORT"
+    if any(w in t for w in ("long", "buy", "bull")):
+        return "LONG"
+    return None
+
+
 HELP_TEXT = """
 🤖 *Jarvis — Command List*
 
@@ -65,7 +75,8 @@ HELP_TEXT = """
 
 *Analysis*
 `scan GBPJPY` — SMC scan any pair + auto-watch levels
-`gbpjpy` or `kj` — full KJ top-down confluence (GBPJPY only)
+`gj buy` or `gj short` — full GBPJPY top-down confluence (direction-aware)
+`kj` — same as `gj`, defaults to best-scoring direction
 `scalp EURUSD` — scalp levels, quality rating + nearest zones for any pair
 `range GBPJPY` — range-bound setups: buy support, sell resistance
 `qpa GBPJPY` — Quarter Price Action: reads how price behaved at prior quarter levels + forecasts next move
@@ -226,19 +237,30 @@ class JarvisMonitor:
                 print(f"[Jarvis] Error scanning {symbol}: {e}")
 
     def _scan_kj_all(self):
-        """KJ scan — GBPJPY only. Alerts when score meets threshold."""
+        """KJ scan — GBPJPY only. Tries both directions, alerts on the higher-scoring one."""
         config = self._load_config()
         threshold = config.get("gbpjpy_alert_threshold", 5)
         try:
-            result = run_gbpjpy_confluence_check(self.client)
-            score = int(result.get("confluence_score", "0/10").split("/")[0])
-            if score >= threshold and score > self._alerted_gbpjpy_score:
-                self._alerted_gbpjpy_score = score
-                self._notify(format_gbpjpy_alert(result))
-                watched = setup_from_gbpjpy(result)
+            best = None
+            best_score = -1
+            for direction in ("LONG", "SHORT"):
+                try:
+                    r = run_gbpjpy_confluence_check(self.client, direction)
+                    s = int(r.get("confluence_score", "0/14").split("/")[0])
+                    if s > best_score:
+                        best_score = s
+                        best = r
+                except Exception:
+                    pass
+            if best is None:
+                return
+            if best_score >= threshold and best_score > self._alerted_gbpjpy_score:
+                self._alerted_gbpjpy_score = best_score
+                self._notify(format_gbpjpy_alert(best))
+                watched = setup_from_gbpjpy(best)
                 if watched:
                     self.watcher.add(watched)
-            elif score < threshold:
+            elif best_score < threshold:
                 self._alerted_gbpjpy_score = 0
         except Exception as e:
             print(f"[Jarvis] KJ scan error: {e}")
@@ -347,15 +369,19 @@ class JarvisMonitor:
             if any(w in text for w in ("confluence", "kj")) or (
                 any(w in text for w in ("gbpjpy", "gj", "guppy")) and "scan" not in text
             ):
-                self._notify("🔍 Running GBPJPY confluence check...")
-                result = run_gbpjpy_confluence_check(self.client)
-                score = result.get("confluence_score", "0/12")
+                direction = _parse_direction(text) or "LONG"
+                dir_emoji = "🟢" if direction == "LONG" else "🔴"
+                self._notify(f"🔍 Running GBPJPY {direction} confluence check...")
+                result = run_gbpjpy_confluence_check(self.client, direction)
+                score = result.get("confluence_score", "0/14")
+                critical_score = result.get("critical_score", "?/5")
+                high_score = result.get("high_score", "?/4")
                 valid = result.get("setup_valid") in (True, "True")
                 entry = result.get("1h_entry", {})
                 reversal = result.get("4h_reversal", {})
-                quarter = result.get("quarter", {})
+                fvg = result.get("fvg", {})
+                choch = result.get("choch_bos", {})
 
-                # Auto-watch levels if setup valid
                 if valid:
                     watched = setup_from_gbpjpy(result)
                     if watched:
@@ -371,7 +397,6 @@ class JarvisMonitor:
                 qpa = result.get("qpa_profiles", {})
                 blown_q = result.get("blown_quarter", {})
 
-                # Floor/ceiling behavioral read
                 floor_lvl = corridor.get("floor", "?")
                 ceil_lvl = corridor.get("ceiling", "?")
                 _rtag = {"STRONG S/R": "🔒", "TRAP ZONE": "🪤", "S/R": "✅",
@@ -381,30 +406,45 @@ class JarvisMonitor:
                 qpa_line = (f"Floor `{floor_lvl}` {_rtag.get(floor_react, '?')} {floor_react} | "
                             f"Ceiling `{ceil_lvl}` {_rtag.get(ceil_react, '?')} {ceil_react}")
 
-                # Blown quarter note
                 blown_note = ""
                 if blown_q.get("detected"):
                     bdir = blown_q["direction"]
                     blvl = blown_q["broken_level"]
                     bago = blown_q.get("bars_ago", "?")
                     arrow = "⬆️" if bdir == "UP" else "⬇️"
-                    blown_note = f"\n{arrow} Blown quarter: broke `{blvl}` {bago}h ago — momentum confirmed"
+                    blown_note = f"\n{arrow} Blown quarter: broke `{blvl}` {bago}h ago"
+
+                fvg_line = (f"FVG: ✅ `{fvg.get('zone', 'N/A')}` ({fvg.get('type', '')})"
+                            if fvg.get("found") else "FVG: ✗ none near zone")
+                choch_line = (f"CHoCH/BOS: ✅ {choch.get('type', '')} @ `{choch.get('broken_level', '')}`"
+                              if choch.get("confirmed") else "CHoCH/BOS: ✗ no 15m structure break")
+
+                checklist = result.get("checklist", {})
+                tiers = result.get("checklist_tiers", {})
+                check_lines = ""
+                for tier, keys in tiers.items():
+                    check_lines += f"\n*{tier}*\n"
+                    for k in keys:
+                        v = checklist.get(k, False)
+                        check_lines += f"{'✅' if v else '❌'} {k.replace('_', ' ').title()}\n"
 
                 status = "✅ SETUP VALID" if valid else "⏳ Not ready yet"
                 return (
-                    f"🎯 *GBPJPY Confluence Check*\n\n"
+                    f"🎯 *GBPJPY Confluence — {dir_emoji} {direction}*\n\n"
                     f"Score: *{score}* — {status}\n"
+                    f"Critical: `{critical_score}` | High: `{high_score}`\n"
                     f"Pattern: `{reversal.get('pattern', 'None detected')}`\n"
                     f"Entry Zone: `{entry.get('entry_zone', 'N/A')}`\n"
                     f"Stop Loss: `{entry.get('sl', 'N/A')}`\n"
                     f"Take Profit: `{entry.get('tp', 'N/A')}`\n"
                     f"R:R: `{entry.get('rr', 'N/A')}:1`\n"
-                    f"Neckline: `{reversal.get('neckline', 'N/A')}`\n"
-                    f"Lot Guidance: `{entry.get('lot_guidance', 'N/A')}`\n"
+                    f"{fvg_line}\n"
+                    f"{choch_line}\n"
                     + (f"{corridor_line}\n" if corridor_line else "")
                     + f"{qpa_line}"
                     + blown_note
-                    + f"\n\n_{result.get('message', '')}_"
+                    + f"\n{check_lines}"
+                    + f"\n_{result.get('message', '')}_"
                     + watch_note
                 )
 
@@ -419,9 +459,7 @@ class JarvisMonitor:
                 return f"✅ Entry timeframe set to `{tf}`.\n_All scans will now use {tf} candles for FVG + sweep detection._"
 
             if text.startswith("kj") or text.startswith("confluence "):
-                symbol = _parse_symbol(text)
-                if not symbol:
-                    return "❓ Usage: `kj GBPJPY`"
+                symbol = _parse_symbol(text) or "GBPJPY"
                 if symbol != "GBPJPY":
                     return (
                         f"⚠️ KJ is GBPJPY-specific — won't be accurate on {symbol}.\n"
